@@ -4,34 +4,32 @@ from loguru import logger
 from neo4j import GraphDatabase
 from src.config import settings
 
+_NEO4J_DRIVER = None
+
 def get_neo4j_driver():
-    if not settings.neo4j_uri:
-        raise ValueError("NEO4J_URI is not set in settings.")
-    driver = GraphDatabase.driver(
-        settings.neo4j_uri,
-        auth=(settings.neo4j_username, settings.neo4j_password)
-    )
-    return driver
+    global _NEO4J_DRIVER
+    if _NEO4J_DRIVER is None:
+        if not settings.neo4j_uri:
+            raise ValueError("NEO4J_URI is not set in settings.")
+        _NEO4J_DRIVER = GraphDatabase.driver(
+            settings.neo4j_uri,
+            auth=(settings.neo4j_username, settings.neo4j_password)
+        )
+    return _NEO4J_DRIVER
 
 def run_write_query(query: str, parameters: Dict[str, Any] = None) -> List[Dict[str, Any]]:
     db_name = settings.neo4j_database or "neo4j"
     driver = get_neo4j_driver()
-    try:
-        with driver.session(database=db_name) as session:
-            result = session.run(query, parameters or {})
-            return [record.data() for record in result]
-    finally:
-        driver.close()
+    with driver.session(database=db_name) as session:
+        result = session.run(query, parameters or {})
+        return [record.data() for record in result]
 
 def run_read_query(query: str, parameters: Dict[str, Any] = None) -> List[Dict[str, Any]]:
     db_name = settings.neo4j_database or "neo4j"
     driver = get_neo4j_driver()
-    try:
-        with driver.session(database=db_name) as session:
-            result = session.run(query, parameters or {})
-            return [record.data() for record in result]
-    finally:
-        driver.close()
+    with driver.session(database=db_name) as session:
+        result = session.run(query, parameters or {})
+        return [record.data() for record in result]
 
 def upsert_entities_and_relations(entities: List[Dict[str, str]], relations: List[Dict[str, str]]) -> None:
     """
@@ -39,16 +37,32 @@ def upsert_entities_and_relations(entities: List[Dict[str, str]], relations: Lis
     """
     logger.info(f"Upserting {len(entities)} entities and {len(relations)} relations to Neo4j...")
     
-    # 1. Upsert entities
+    # 1. Collect all unique entities from both lists (to prevent MATCH failures in step 2)
+    entity_map = {}
+    for ent in entities:
+        entity_map[ent["name"]] = ent.get("label", "Entity")
+        
+    for rel in relations:
+        src = rel["source"]
+        tgt = rel["target"]
+        if src not in entity_map:
+            entity_map[src] = "Entity"
+        if tgt not in entity_map:
+            entity_map[tgt] = "Entity"
+            
+    entities_payload = [{"name": name, "label": label} for name, label in entity_map.items()]
+    
+    # Upsert all entities first
     entity_query = """
     UNWIND $entities AS ent
     MERGE (e:Entity {name: ent.name})
     SET e.label = ent.label
     """
-    run_write_query(entity_query, {"entities": entities})
+    run_write_query(entity_query, {"entities": entities_payload})
     
-    # 2. Upsert relations
-    # We must sanitize the relationship types and run them safely.
+    # 2. Group relations by sanitized type and upsert them using MATCH (preventing lock contention)
+    from collections import defaultdict
+    relations_by_type = defaultdict(list)
     for rel in relations:
         source = rel["source"]
         target = rel["target"]
@@ -59,13 +73,16 @@ def upsert_entities_and_relations(entities: List[Dict[str, str]], relations: Lis
         if not clean_rel_type:
             clean_rel_type = "RELATED_TO"
             
+        relations_by_type[clean_rel_type].append({"source": source, "target": target})
+        
+    for clean_rel_type, rels in relations_by_type.items():
         relation_query = f"""
-        MATCH (s:Entity {{name: $source}})
-        MATCH (t:Entity {{name: $target}})
+        UNWIND $rels AS rel
+        MATCH (s:Entity {{name: rel.source}})
+        MATCH (t:Entity {{name: rel.target}})
         MERGE (s)-[r:{clean_rel_type}]->(t)
-        RETURN r
         """
-        run_write_query(relation_query, {"source": source, "target": target})
+        run_write_query(relation_query, {"rels": rels})
         
     logger.info("Graph DB upsert completed successfully.")
 
@@ -102,18 +119,40 @@ def find_shortest_path(start_entity: str, end_entity: str, max_depth: int = 5) -
     path_nodes = []
     path_rels = []
     
-    for i, node in enumerate(path.nodes):
-        path_nodes.append({
-            "name": node.get("name"),
-            "label": list(node.labels)[0] if node.labels else "Entity"
-        })
-        
-    for rel in path.relationships:
-        path_rels.append({
-            "start": rel.nodes[0].get("name"),
-            "end": rel.nodes[1].get("name"),
-            "type": rel.type
-        })
+    if isinstance(path, list):
+        # record.data() converts path to a list of alternating dicts (nodes) and strings (relationship types)
+        # e.g., [{'name': 'Alice', 'label': 'Person'}, 'KNOWS', {'name': 'Bob', 'label': 'Person'}]
+        for i, item in enumerate(path):
+            if i % 2 == 0:
+                # Node
+                path_nodes.append({
+                    "name": item.get("name"),
+                    "label": item.get("label", "Entity")
+                })
+            else:
+                # Relationship type string connecting previous node to next node
+                prev_node = path[i - 1]
+                next_node = path[i + 1]
+                path_rels.append({
+                    "start": prev_node.get("name"),
+                    "end": next_node.get("name"),
+                    "type": item if isinstance(item, str) else str(item)
+                })
+    else:
+        # Fallback in case it's somehow a Neo4j Path object directly
+        for node in getattr(path, "nodes", []):
+            path_nodes.append({
+                "name": node.get("name"),
+                "label": list(node.labels)[0] if getattr(node, "labels", None) else "Entity"
+            })
+        for rel in getattr(path, "relationships", []):
+            start_node = rel.nodes[0] if getattr(rel, "nodes", None) else None
+            end_node = rel.nodes[1] if getattr(rel, "nodes", None) and len(rel.nodes) > 1 else None
+            path_rels.append({
+                "start": start_node.get("name") if start_node else None,
+                "end": end_node.get("name") if end_node else None,
+                "type": getattr(rel, "type", "RELATED_TO")
+            })
         
     return {
         "found": True,

@@ -1,3 +1,4 @@
+import os
 import uuid
 from typing import List, Dict, Any
 from loguru import logger
@@ -8,9 +9,7 @@ from src.config import settings
 
 # Initialize clients
 def get_openai_client() -> OpenAI:
-    api_key = settings.openai_api_key or settings.openai_key
-    if not api_key:
-        raise ValueError("OpenAI API key is not configured in settings.")
+    api_key = settings.openai_api_key or os.getenv("OPENAI_API_KEY")
     return OpenAI(api_key=api_key)
 
 def get_pinecone_index():

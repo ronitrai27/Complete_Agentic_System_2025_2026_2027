@@ -1,6 +1,14 @@
+import os
+from pathlib import Path
+from dotenv import load_dotenv
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from pydantic import Field
 from typing import Optional
+
+# Force load .env from the project root and override any system environment variables
+_ROOT = Path(__file__).resolve().parent.parent
+load_dotenv(_ROOT / ".env", override=True)
+
 
 class Settings(BaseSettings):
     # Instruct Pydantic to read from the .env file in the root directory
@@ -30,3 +38,5 @@ class Settings(BaseSettings):
 
 # Export a single, globally available settings object
 settings = Settings()
+
+

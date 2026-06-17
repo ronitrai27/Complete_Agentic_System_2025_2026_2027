@@ -197,3 +197,7 @@ ai_flow/
     ├── test_agents.py              # Mock-based agent tests
     └── test_rag_utilities.py       # RAG utility unit tests
 ```
+
+<!-- ---------- -->
+**Fast Path (LlamaParse Text Extraction):** Provides instant, high-speed context to the agent so you can chat with the uploaded document immediately.
+**Slow Path (Background Knowledge Builder):** Concurrently splits text into chunks, generates vector embeddings, indexes them in Pinecone, performs spaCy entity and relationship extraction, ingests the resulting knowledge graph into Neo4j, and adds the text to the BM25 index.

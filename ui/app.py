@@ -1,37 +1,369 @@
-import streamlit as st
+"""
+AI Agent Chat UI — plain Streamlit, no custom CSS.
+"""
+import os
+import sys
+import tempfile
+import threading
+import time
+import uuid
+from pathlib import Path
+
+# ── Load .env FIRST so every os.environ lookup gets the right values ──────────
+from dotenv import load_dotenv
+ROOT = Path(__file__).resolve().parent.parent   # project root  (ai_flow/)
+load_dotenv(ROOT / ".env", override=True)       # explicit path, always works
+
+# ── Make src/ importable ──────────────────────────────────────────────────────
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+import importlib
+for mod in ["src.agents.state", "src.agents.rag_agent", "src.pipelines.ingestion"]:
+    if mod in sys.modules:
+        try:
+            importlib.reload(sys.modules[mod])
+        except Exception:
+            pass
+
+
 from src.config import settings
 
+print("[app.py] Active OpenAI API Key loaded:", bool(settings.openai_api_key), flush=True)
+from src.utils import event_bus
+
+import streamlit as st
+
+# ─── Page config ─────────────────────────────────────────────────────────────
 st.set_page_config(
-    page_title="Production AI Flow Portal",
+    page_title="AI Agent",
     page_icon="⚡",
-    layout="wide",
+    layout="centered",
+    initial_sidebar_state="expanded",
 )
 
-st.title("⚡ Production AI Flow Portal")
-st.write("Welcome to your production-grade Streamlit Dashboard, integrated with Poetry, Airflow, Pinecone, and Neo4j.")
+# ─── Session state defaults ───────────────────────────────────────────────────
+def init_state():
+    defaults = {
+        "messages": [],
+        "events": [],
+        "conv_id": str(uuid.uuid4()),
+        "agent_running": False,
+        "hitl_pending": False,
+        "hitl_state": None,
+        "uploaded_path": None,
+        "uploaded_name": None,
+        "auth_pending": False,
+        "auth_state": None,   # {"tool_name": ..., "auth_id": ..., "auth_url": ...}
+    }
+    for k, v in defaults.items():
+        if k not in st.session_state:
+            st.session_state[k] = v
+
+init_state()
+
+
+# ─── Background ingestion ─────────────────────────────────────────────────────
+def run_background_ingestion(file_path: str, doc_id: str, conv_id: str):
+    try:
+        from src.pipelines.ingestion import ingest_document_pipeline
+        ingest_document_pipeline(file_path, doc_id, conv_id)
+    except Exception as e:
+        pass  # silent — it's background
+
+
+def start_background_ingestion(file_path: str, doc_id: str, conv_id: str):
+    t = threading.Thread(target=run_background_ingestion, args=(file_path, doc_id, conv_id), daemon=True)
+    t.start()
+
+
+# ─── Agent runner ─────────────────────────────────────────────────────────────
+def run_agent_turn(user_query: str, uploaded_path, conv_id: str):
+    from src.agents.rag_agent import compile_agent
+    from src.agents.state import create_initial_state
+
+    event_bus.clear()
+    agent = compile_agent()
+    state = create_initial_state(
+        user_query=user_query,
+        conversation_id=conv_id,
+        uploaded_file_path=uploaded_path,
+    )
+    config = {"configurable": {"thread_id": conv_id}}
+    result = agent.invoke(state, config=config)
+
+    # Check if the graph paused for OAuth authorization
+    interrupts = result.get("__interrupt__", [])
+    if interrupts:
+        for intr in interrupts:
+            val = intr.value if hasattr(intr, "value") else intr
+            if isinstance(val, dict) and val.get("type") == "authorization_required":
+                auth = val.get("auth_response", {})
+                result["_auth_interrupt"] = {
+                    "tool_name": val.get("tool_name", "unknown tool"),
+                    "auth_id":   auth.get("id"),
+                    "auth_url":  auth.get("url"),
+                }
+                break
+    return result
+
+
+def resume_agent_after_auth(conv_id: str, authorized: bool):
+    """Resume the graph after OAuth is completed (or rejected)."""
+    from src.agents.rag_agent import compile_agent
+    from langgraph.types import Command
+    agent = compile_agent()
+    config = {"configurable": {"thread_id": conv_id}}
+    return agent.invoke(Command(resume={"authorized": authorized}), config=config)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# RENDER
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@st.fragment(run_every=1.0)
+def render_sidebar_progress(conv_id: str):
+    from src.pipelines.ingestion import INGESTION_PROGRESS
+    if conv_id in INGESTION_PROGRESS:
+        docs_progress = INGESTION_PROGRESS[conv_id]
+        # Check if any ingestion is running
+        running = any(p.get("status") not in ("completed", "failed") for p in docs_progress.values())
+        if running:
+            st.caption("⚡ Background ingestion active...")
+            
+        for doc_id, prog in list(docs_progress.items()):
+            filename = prog.get("filename", doc_id)
+            percent = prog["percent"]
+            status = prog["status"]
+            details = prog["details"]
+            
+            expanded = status not in ("completed", "failed")
+            with st.expander(f"📄 {filename}", expanded=expanded):
+                if status == "completed":
+                    st.success("🎉 Ingestion Complete!")
+                    st.markdown(details)
+                elif status == "failed":
+                    st.error("❌ Ingestion Failed")
+                    st.caption(f"Reason: {details}")
+                else:
+                    st.progress(percent / 100.0, text=f"**{percent}% — {status}**")
+                    if details:
+                        st.caption(details)
+    else:
+        st.info("No documents uploaded in this thread yet. Upload a file below to build memory!")
+
+# ─── Sidebar Progress ────────────────────────────────────────────────────────
+with st.sidebar:
+    st.markdown("## 🧠 Knowledge Builder")
+    st.markdown(
+        "Builds a knowledge base (Pinecone vector store, BM25 index, and Neo4j entities graph) "
+        "in the background while you chat."
+    )
+    st.divider()
+
+    from src.pipelines.ingestion import INGESTION_PROGRESS
+    conv_id = st.session_state.conv_id
+
+    if conv_id in INGESTION_PROGRESS:
+        prog = INGESTION_PROGRESS[conv_id]
+        percent = prog["percent"]
+        status = prog["status"]
+        details = prog["details"]
+
+        if status == "completed":
+            st.success("🎉 Ingestion Complete!")
+            st.info(f"**Details:**\n{details}")
+        elif status == "failed":
+            st.error("❌ Ingestion Failed")
+            st.caption(f"Reason: {details}")
+        else:
+            # Running
+            st.warning("⚡ Ingestion in progress...")
+            st.progress(percent / 100.0, text=f"**{percent}% — {status}**")
+            if details:
+                st.caption(details)
+            
+            # Auto-refresh: rerun the app after a tiny delay
+            time.sleep(0.5)
+            st.rerun()
+    else:
+        st.info("No documents uploaded in this thread yet. Upload a file below to build memory!")
+
+st.title("⚡ AI Agent")
+st.caption(f"Loaded OpenAI Key: `{settings.openai_api_key[:24]}...{settings.openai_api_key[-24:]}`")
+st.divider()
+
+# ── Chat messages ─────────────────────────────────────────────────────────────
+for msg in st.session_state.messages:
+    role = "user" if msg["role"] == "user" else "assistant"
+    with st.chat_message(role):
+        st.write(msg["content"])
+
+# ── Live events (shown after messages) ───────────────────────────────────────
+if st.session_state.events:
+    with st.expander("🔍 Agent trace", expanded=False):
+        for e in st.session_state.events[-20:]:
+            st.caption(e.get("message", ""))
+
+# ── HITL interrupt ─────────────────────────────────────────────────────────────
+if st.session_state.hitl_pending and st.session_state.hitl_state:
+    preview = (st.session_state.hitl_state.get("final_answer") or "")[:300]
+    st.info(f"💾 **Save to long-term memory?**\n\n{preview}…")
+    col_a, col_r, _ = st.columns([1, 1, 4])
+    with col_a:
+        if st.button("✅ Accept", type="primary", key="hitl_accept"):
+            with st.spinner("Saving to memory (Neo4j graph, Pinecone & SQLite)..."):
+                from src.agents.rag_agent import resume_agent
+                resume_agent(st.session_state.conv_id, {"approved": True, "notes": None})
+            st.session_state.hitl_pending = False
+            st.rerun()
+    with col_r:
+        if st.button("✗ Reject", key="hitl_reject"):
+            with st.spinner("Discarding memory turn..."):
+                from src.agents.rag_agent import resume_agent
+                resume_agent(st.session_state.conv_id, {"approved": False})
+            st.session_state.hitl_pending = False
+            st.rerun()
+
+# ── MCP OAuth authorization interrupt ─────────────────────────────────────────
+if st.session_state.auth_pending and st.session_state.auth_state:
+    auth = st.session_state.auth_state
+    tool_name = auth.get("tool_name", "an external tool")
+    auth_url  = auth.get("auth_url", "")
+    st.warning(
+        f"🔐 **Authorization required for `{tool_name}`**\n\n"
+        f"Click the link below to grant access, then click **I've Authorized** to continue."
+    )
+    if auth_url:
+        st.markdown(f"👉 [**Open authorization link**]({auth_url})", unsafe_allow_html=False)
+    col_auth, col_deny, _ = st.columns([1.5, 1, 3.5])
+    with col_auth:
+        if st.button("✅ I've Authorized", type="primary", key="auth_accept"):
+            result = resume_agent_after_auth(st.session_state.conv_id, authorized=True)
+            answer = result.get("final_answer", "Authorization complete — please re-ask your question.")
+            st.session_state.messages.append({"role": "agent", "content": answer})
+            st.session_state.auth_pending = False
+            st.session_state.auth_state = None
+            st.rerun()
+    with col_deny:
+        if st.button("✗ Cancel", key="auth_deny"):
+            st.session_state.messages.append({
+                "role": "agent",
+                "content": f"❌ Authorization for `{tool_name}` was cancelled."
+            })
+            st.session_state.auth_pending = False
+            st.session_state.auth_state = None
+            st.rerun()
 
 st.divider()
 
-col1, col2 = st.columns(2)
+# ── File uploader ─────────────────────────────────────────────────────────────
+uploaded_file = st.file_uploader(
+    "Attach a file (optional)",
+    type=["pdf", "docx", "txt", "png", "jpg", "jpeg", "md"],
+    key="file_upload",
+)
 
-with col1:
-    st.subheader("🔌 Configuration Status")
-    st.write("Status of database credentials loaded from `.env` via `Pydantic Settings`:")
-    
-    st.markdown(f"**Pinecone Index:** `{settings.pinecone_index_name}`")
-    st.markdown(f"**Neo4j Host:** `{settings.neo4j_uri or '⚠️ Not Configured'}`")
-    st.markdown(f"**Neo4j Database:** `{settings.neo4j_database or 'default'}`")
-    st.markdown(f"**OpenAI API Key Configured?** `{'Yes' if settings.openai_api_key else 'No'}`")
+if uploaded_file and uploaded_file.name != st.session_state.uploaded_name:
+    tmp_dir  = tempfile.mkdtemp()
+    tmp_path = os.path.join(tmp_dir, uploaded_file.name)
+    with open(tmp_path, "wb") as f:
+        f.write(uploaded_file.getvalue())
+    st.session_state.uploaded_path = tmp_path
+    st.session_state.uploaded_name = uploaded_file.name
+    st.session_state.messages.append({
+        "role": "agent",
+        "content": f"📎 **{uploaded_file.name}** received — indexing in background…"
+    })
+    start_background_ingestion(tmp_path, f"{uploaded_file.name}_{uuid.uuid4().hex[:8]}", st.session_state.conv_id)
+    st.rerun()
 
-with col2:
-    st.subheader("⚙️ Local Pipeline Executor")
-    st.write("Trigger the document ingestion pipeline logic directly from here (bypassing the Airflow scheduler for debug/admin runs):")
-    
-    if st.button("Run Ingestion Pipeline", type="primary"):
-        with st.spinner("Executing pipeline in background..."):
-            from src.pipelines.ingestion import ingest_documents_pipeline
+# ── Chat input (Streamlit native — always at bottom) ─────────────────────────
+user_input = st.chat_input("Ask anything…", disabled=st.session_state.agent_running)
+
+if user_input and user_input.strip():
+    st.session_state.messages.append({"role": "user", "content": user_input.strip()})
+    st.session_state.events = []
+    st.rerun()
+
+# ─── Auto-run agent ───────────────────────────────────────────────────────────
+needs_response = (
+    st.session_state.messages
+    and st.session_state.messages[-1]["role"] == "user"
+    and not st.session_state.agent_running
+    and not st.session_state.hitl_pending
+    and not st.session_state.auth_pending
+)
+
+if needs_response:
+    query         = st.session_state.messages[-1]["content"]
+    uploaded_path = st.session_state.uploaded_path
+    # Clear file path from state immediately so subsequent turns do not pass it
+    st.session_state.uploaded_path = None
+    conv_id       = st.session_state.conv_id
+    st.session_state.agent_running = True
+
+    with st.status("⚡ Agent thinking…", expanded=True) as status:
+        events_ph = st.empty()
+
+        result_holder = [None]
+        error_holder  = [None]
+
+        def _agent_thread():
             try:
-                ingest_documents_pipeline()
-                st.success("Pipeline run finished! Check your console/logs.")
+                result_holder[0] = run_agent_turn(query, uploaded_path, conv_id)
             except Exception as e:
-                st.error(f"Pipeline failed: {e}")
+                error_holder[0] = e
+
+        t = threading.Thread(target=_agent_thread, daemon=True)
+        t.start()
+
+        all_events = []
+        while t.is_alive():
+            new = event_bus.get_all()
+            if new:
+                all_events.extend(new)
+                st.session_state.events = all_events.copy()
+                events_ph.caption("  \n".join(e.get("message", "") for e in all_events[-10:]))
+            time.sleep(0.15)
+
+        all_events.extend(event_bus.get_all())
+        st.session_state.events = all_events
+        result = result_holder[0]
+        st.session_state.agent_running = False
+
+        if error_holder[0]:
+            status.update(label="❌ Agent failed", state="error")
+            st.session_state.messages.append({
+                "role": "agent",
+                "content": f"Sorry, something went wrong:\n\n{error_holder[0]}"
+            })
+        elif result:
+            answer = result.get("final_answer", "No answer returned.")
+
+            # ── OAuth interrupt: show auth link instead of an answer ──────────
+            if result.get("_auth_interrupt"):
+                auth_info = result["_auth_interrupt"]
+                st.session_state.auth_pending = True
+                st.session_state.auth_state = auth_info
+                status.update(label="🔐 Authorization required", state="complete", expanded=False)
+                st.session_state.messages.append({
+                    "role": "agent",
+                    "content": (
+                        f"🔐 **I need access to `{auth_info['tool_name']}`.**\n\n"
+                        f"Please authorize below so I can continue."
+                    )
+                })
+            elif result.get("__interrupt__"):
+                # Legacy HITL memory checkpoint
+                status.update(label="✅ Done", state="complete", expanded=False)
+                st.session_state.messages.append({"role": "agent", "content": answer})
+                st.session_state.hitl_pending = True
+                st.session_state.hitl_state   = result
+            else:
+                status.update(label="✅ Done", state="complete", expanded=False)
+                st.session_state.messages.append({"role": "agent", "content": answer})
+        else:
+            status.update(label="⚠️ No response", state="error")
+
+    st.rerun()

@@ -1,4 +1,6 @@
 import os
+import sys
+import uuid
 from loguru import logger
 from src.config import settings
 from src.utils.parser import parse_file
@@ -7,7 +9,28 @@ from src.utils.entity_extractor import extract_knowledge_graph_elements
 from src.utils.graph_store import upsert_entities_and_relations
 from src.utils.keyword_search import add_to_bm25_index
 
-def ingest_document_pipeline(file_path: str, document_id: str = None) -> dict:
+# Preserve the dictionary reference across hot-reloads so Streamlit doesn't wipe progress updates
+if "src.pipelines.ingestion" in sys.modules and hasattr(sys.modules["src.pipelines.ingestion"], "INGESTION_PROGRESS"):
+    INGESTION_PROGRESS = sys.modules["src.pipelines.ingestion"].INGESTION_PROGRESS
+else:
+    INGESTION_PROGRESS = {}
+
+def _update_progress(conversation_id: str, document_id: str, percent: int, status: str, details: str = "", filename: str = ""):
+    if conversation_id and document_id:
+        if conversation_id not in INGESTION_PROGRESS:
+            INGESTION_PROGRESS[conversation_id] = {}
+        INGESTION_PROGRESS[conversation_id][document_id] = {
+            "percent": percent,
+            "status": status,
+            "details": details,
+            "filename": filename or os.path.basename(document_id),
+        }
+
+def ingest_document_pipeline(
+    file_path: str,
+    document_id: str = None,
+    conversation_id: str = None,
+) -> dict:
     """
     Background (slow path) pipeline:
     1. Parse file using LlamaParse
@@ -20,45 +43,87 @@ def ingest_document_pipeline(file_path: str, document_id: str = None) -> dict:
     if not document_id:
         document_id = os.path.basename(file_path)
 
+    filename = os.path.basename(file_path)
     logger.info(f"Starting document ingestion pipeline for: {document_id}")
-    
-    # 1. Parsing
-    logger.info("Step 1: Parsing document using LlamaParse...")
-    text_content = parse_file(file_path)
-    if not text_content:
-        raise ValueError(f"No text extracted from file: {file_path}")
+    _update_progress(conversation_id, document_id, 0, "Starting ingestion...", "", filename)
+
+    try:
+        # 1. Parsing
+        _update_progress(conversation_id, document_id, 10, "Parsing document using LlamaParse...", "Running LlamaParse parser on document...", filename)
+        logger.info("Step 1: Parsing document using LlamaParse...")
+        text_content = parse_file(file_path)
+        if not text_content:
+            _update_progress(conversation_id, document_id, 100, "failed", "No text extracted from file", filename)
+            raise ValueError(f"No text extracted from file: {file_path}")
+            
+        # 2. Chunking
+        _update_progress(conversation_id, document_id, 35, "Splitting text into chunks...", "Splitting parsed markdown text using SentenceSplitter...", filename)
+        logger.info("Step 2: Splitting text into chunks...")
+        chunks = chunk_text(text_content)
+        chunks_count = len(chunks)
+        _update_progress(conversation_id, document_id, 45, "Chunks generated", f"Successfully split document into {chunks_count} chunks.", filename)
         
-    # 2. Chunking
-    logger.info("Step 2: Splitting text into chunks...")
-    chunks = chunk_text(text_content)
-    
-    # 3. Vector Database Indexing (Pinecone)
-    logger.info("Step 3: Indexing chunks in Pinecone...")
-    metadata_base = {"filename": os.path.basename(file_path)}
-    index_chunks(document_id, chunks, metadata_base)
-    
-    # 4. Entity Extraction
-    logger.info("Step 4: Extracting entities & relationships...")
-    kg_elements = extract_knowledge_graph_elements(text_content)
-    entities = kg_elements.get("entities", [])
-    relations = kg_elements.get("relations", [])
-    
-    # 5. Graph Database Ingestion (Neo4j)
-    logger.info("Step 5: Loading entities and relations into Neo4j...")
-    if entities or relations:
-        upsert_entities_and_relations(entities, relations)
-    else:
-        logger.warning("No entities or relations found to load into Neo4j.")
+        # 3. Vector Database Indexing (Pinecone)
+        _update_progress(conversation_id, document_id, 50, "Generating embeddings & indexing in Pinecone...", f"Generating OpenAI embeddings and indexing {chunks_count} chunks in Pinecone...", filename)
+        logger.info("Step 3: Indexing chunks in Pinecone...")
+        metadata_base = {"filename": os.path.basename(file_path)}
+        index_chunks(document_id, chunks, metadata_base)
+        _update_progress(conversation_id, document_id, 65, "Vector store updated", f"Successfully indexed {chunks_count} chunks in Pinecone vector store.", filename)
         
-    # 6. Keyword Index Ingestion (BM25)
-    logger.info("Step 6: Adding chunks to BM25 index...")
-    add_to_bm25_index(document_id, chunks, metadata_base)
-    
-    logger.info(f"Ingestion pipeline completed successfully for document: {document_id}")
-    
-    return {
-        "document_id": document_id,
-        "chunks_count": len(chunks),
-        "entities_count": len(entities),
-        "relations_count": len(relations)
-    }
+        # 4. Entity Extraction
+        _update_progress(conversation_id, document_id, 70, "Extracting entities & relationships (spaCy)...", "Extracting named entities and relationships from text using spaCy NER...", filename)
+        logger.info("Step 4: Extracting entities & relationships...")
+        kg_elements = extract_knowledge_graph_elements(text_content)
+        entities = kg_elements.get("entities", [])
+        relations = kg_elements.get("relations", [])
+        
+        # Format a preview of extracted entities and relationships
+        entity_names = [e["name"] for e in entities]
+        entity_preview = ", ".join(entity_names[:8]) + ("..." if len(entity_names) > 8 else "")
+        
+        relation_parts = []
+        for r in relations[:3]:
+            relation_parts.append(f"{r['source']}->{r['target']}")
+        relation_preview = f"Found {len(relations)} relationship(s) (e.g., {', '.join(relation_parts)})" if relations else "No relationships found"
+        
+        details_extraction = f"Extracted {len(entities)} entities: {entity_preview}\n\n{relation_preview}"
+        _update_progress(conversation_id, document_id, 80, "Entity extraction complete", details_extraction, filename)
+        
+        # 5. Graph Database Ingestion (Neo4j)
+        _update_progress(conversation_id, document_id, 85, "Upserting graph into Neo4j database...", f"Loading {len(entities)} entities and {len(relations)} relations into Neo4j graph db...", filename)
+        logger.info("Step 5: Loading entities and relations into Neo4j...")
+        if entities or relations:
+            upsert_entities_and_relations(entities, relations)
+        else:
+            logger.warning("No entities or relations found to load into Neo4j.")
+        _update_progress(conversation_id, document_id, 90, "Neo4j graph database updated", f"Loaded {len(entities)} entities and {len(relations)} relations into Neo4j graph store.", filename)
+            
+        # 6. Keyword Index Ingestion (BM25)
+        _update_progress(conversation_id, document_id, 95, "Adding chunks to BM25 index...", f"Adding {chunks_count} chunks to disk-backed BM25 keyword index...", filename)
+        logger.info("Step 6: Adding chunks to BM25 index...")
+        add_to_bm25_index(document_id, chunks, metadata_base)
+        
+        logger.info(f"Ingestion pipeline completed successfully for document: {document_id}")
+        
+        final_details = (
+            f"✅ **Ingestion Summary:**\n"
+            f"- **Chunks Ingested:** {chunks_count}\n"
+            f"- **Entities Extracted:** {len(entities)}\n"
+            f"- **Relationships Extracted:** {len(relations)}\n"
+            f"- **Graph stored:** Neo4j\n"
+            f"- **Lexical index:** BM25 updated\n"
+            f"\n**Entities Preview:**\n{entity_preview}"
+        )
+        _update_progress(conversation_id, document_id, 100, "completed", final_details, filename)
+        
+        return {
+            "document_id": document_id,
+            "chunks_count": len(chunks),
+            "entities_count": len(entities),
+            "relations_count": len(relations)
+        }
+
+    except Exception as e:
+        logger.error(f"Ingestion failed for {document_id}: {e}")
+        _update_progress(conversation_id, document_id, 100, "failed", str(e), filename)
+        raise

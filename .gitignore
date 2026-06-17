@@ -138,3 +138,9 @@ airflow.cfg
 webserver_config.py
 *.pid
 logs/
+
+# Data files
+*.db
+*.pkl
+data/
+
