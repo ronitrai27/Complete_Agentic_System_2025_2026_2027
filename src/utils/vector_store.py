@@ -85,7 +85,11 @@ def index_chunks(document_id: str, chunks: List[str], metadata_base: Dict[str, A
         
     logger.info(f"Successfully finished indexing document {document_id}.")
 
-def query_vector_store(query_text: str, top_k: int = 5) -> List[Dict[str, Any]]:
+def query_vector_store(
+    query_text: str,
+    top_k: int = 5,
+    conversation_id: str | None = None,
+) -> List[Dict[str, Any]]:
     """
     Queries Pinecone for the top_k matching chunks.
     """
@@ -93,11 +97,25 @@ def query_vector_store(query_text: str, top_k: int = 5) -> List[Dict[str, Any]]:
     query_vector = embed_text(query_text)
     index = get_pinecone_index()
     
+    metadata_filter: Dict[str, Any] = {"type": {"$ne": "conversation"}}
+    if conversation_id:
+        metadata_filter = {
+            "$or": [
+                {"type": {"$ne": "conversation"}},
+                {
+                    "$and": [
+                        {"type": {"$eq": "conversation"}},
+                        {"conversation_id": {"$eq": conversation_id}},
+                    ]
+                },
+            ]
+        }
+
     response = index.query(
         vector=query_vector,
         top_k=top_k,
         include_metadata=True,
-        filter={"type": {"$ne": "conversation"}}
+        filter=metadata_filter,
     )
     
     results = []

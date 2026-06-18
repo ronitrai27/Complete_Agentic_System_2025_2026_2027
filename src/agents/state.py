@@ -56,6 +56,7 @@ class AgentState(TypedDict):
     - route: which path the router chose (search | rag | direct)
     """
     conversation_id: str
+    turn_id: str
     
     # Conversation history — uses operator.add so each node APPENDS to this list
     messages: Annotated[List[Message], operator.add]
@@ -95,6 +96,7 @@ def create_initial_state(
     """Helper to construct a fully initialized AgentState dictionary."""
     return {
         "conversation_id": conversation_id or str(uuid.uuid4()),
+        "turn_id": str(uuid.uuid4()),
         "messages": [],
         "user_query": user_query,
         "uploaded_file_path": uploaded_file_path,
@@ -106,4 +108,3 @@ def create_initial_state(
         "save_requested": False,
         "route": "direct",
     }
-

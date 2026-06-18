@@ -3,7 +3,6 @@ AI Agent Chat UI — plain Streamlit, no custom CSS.
 """
 import os
 import sys
-import tempfile
 import threading
 import time
 import uuid
@@ -76,16 +75,26 @@ init_state()
 
 
 # ─── Background ingestion ─────────────────────────────────────────────────────
-def run_background_ingestion(file_path: str, doc_id: str, conv_id: str):
+def run_background_ingestion(file_path: str, doc_id: str, conv_id: str, checksum: str, original_filename: str):
     try:
         from src.pipelines.ingestion import ingest_document_pipeline
-        ingest_document_pipeline(file_path, doc_id, conv_id)
+        ingest_document_pipeline(
+            file_path,
+            doc_id,
+            conv_id,
+            checksum=checksum,
+            original_filename=original_filename,
+        )
     except Exception as e:
-        pass  # silent — it's background
+        print(f"[ingestion] Background ingestion failed for {original_filename}: {e}", flush=True)
 
 
-def start_background_ingestion(file_path: str, doc_id: str, conv_id: str):
-    t = threading.Thread(target=run_background_ingestion, args=(file_path, doc_id, conv_id), daemon=True)
+def start_background_ingestion(file_path: str, doc_id: str, conv_id: str, checksum: str, original_filename: str):
+    t = threading.Thread(
+        target=run_background_ingestion,
+        args=(file_path, doc_id, conv_id, checksum, original_filename),
+        daemon=True,
+    )
     t.start()
 
 
@@ -172,11 +181,14 @@ with st.sidebar:
         "in the background while you chat."
     )
     st.divider()
+    if st.button("View relationships", use_container_width=True):
+        st.switch_page("pages/relationships.py")
+    st.divider()
 
     render_sidebar_progress(st.session_state.conv_id)
 
 st.title("⚡ AI Agent")
-st.caption(f"Loaded OpenAI Key: `{settings.openai_api_key[:24]}...{settings.openai_api_key[-24:]}`")
+st.caption("Agentic search, document intelligence, and connected knowledge.")
 st.divider()
 
 # ── Chat messages ─────────────────────────────────────────────────────────────
@@ -255,19 +267,35 @@ uploaded_file = st.file_uploader(
     key="file_upload",
 )
 
-if uploaded_file and uploaded_file.name != st.session_state.uploaded_name:
-    tmp_dir  = tempfile.mkdtemp()
-    tmp_path = os.path.join(tmp_dir, uploaded_file.name)
-    with open(tmp_path, "wb") as f:
-        f.write(uploaded_file.getvalue())
-    st.session_state.uploaded_path = tmp_path
-    st.session_state.uploaded_name = uploaded_file.name
-    st.session_state.messages.append({
-        "role": "agent",
-        "content": f"📎 **{uploaded_file.name}** received — indexing in background…"
-    })
-    start_background_ingestion(tmp_path, f"{uploaded_file.name}_{uuid.uuid4().hex[:8]}", st.session_state.conv_id)
-    st.rerun()
+if uploaded_file:
+    from src.utils.uploads import store_upload
+
+    try:
+        stored = store_upload(
+            uploaded_file.name,
+            uploaded_file.getvalue(),
+            st.session_state.conv_id,
+        )
+        upload_key = f"{stored.document_id}:{stored.safe_name}"
+        if upload_key != st.session_state.uploaded_name:
+            st.session_state.uploaded_path = stored.path
+            st.session_state.uploaded_name = upload_key
+            message = (
+                f"**{stored.safe_name}** received — indexing in the background…"
+                if stored.created
+                else f"**{stored.safe_name}** was already uploaded — reusing its safe stored copy."
+            )
+            st.session_state.messages.append({"role": "agent", "content": message})
+            start_background_ingestion(
+                stored.path,
+                stored.document_id,
+                st.session_state.conv_id,
+                stored.checksum,
+                stored.safe_name,
+            )
+            st.rerun()
+    except ValueError as exc:
+        st.error(str(exc))
 
 # ── Chat input (Streamlit native — always at bottom) ─────────────────────────
 user_input = st.chat_input("Ask anything…", disabled=st.session_state.agent_running)

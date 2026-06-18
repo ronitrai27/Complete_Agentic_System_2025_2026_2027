@@ -5,7 +5,11 @@ from src.utils.keyword_search import query_bm25
 from src.utils.graph_store import get_neighbors, get_two_hop_neighbors
 from src.utils.entity_extractor import extract_entities
 
-def get_hybrid_context(query_text: str, top_k: int = 4) -> Dict[str, Any]:
+def get_hybrid_context(
+    query_text: str,
+    top_k: int = 4,
+    conversation_id: str | None = None,
+) -> Dict[str, Any]:
     """
     Executes hybrid search combining:
     1. Pinecone Vector Search (Semantic)
@@ -19,7 +23,11 @@ def get_hybrid_context(query_text: str, top_k: int = 4) -> Dict[str, Any]:
     # 1. Pinecone search
     vector_results = []
     try:
-        vector_results = query_vector_store(query_text, top_k=top_k)
+        vector_results = query_vector_store(
+            query_text,
+            top_k=top_k,
+            conversation_id=conversation_id,
+        )
     except Exception as e:
         logger.error(f"Pinecone query failed: {e}")
         

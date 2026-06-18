@@ -129,6 +129,55 @@ def get_two_hop_neighbors(entity_name: str, limit: int = 20) -> List[Dict[str, A
     records = run_read_query(query, {"name": clean_name, "limit": limit})
     return records
 
+
+def get_graph_snapshot(
+    limit: int = 1000,
+    search: str = "",
+    entity_label: str = "",
+) -> Dict[str, Any]:
+    """Return a read-only, JSON-serializable snapshot for visualization."""
+    safe_limit = max(1, min(int(limit), 5000))
+    query = """
+    MATCH (source:Entity)-[relationship]->(target:Entity)
+    WHERE ($search = ""
+           OR toLower(source.name) CONTAINS toLower($search)
+           OR toLower(target.name) CONTAINS toLower($search)
+           OR toLower(type(relationship)) CONTAINS toLower($search))
+      AND ($entity_label = ""
+           OR toLower(source.label) = toLower($entity_label)
+           OR toLower(target.label) = toLower($entity_label))
+    RETURN source.name AS source,
+           coalesce(source.label, "Entity") AS source_label,
+           type(relationship) AS relation,
+           target.name AS target,
+           coalesce(target.label, "Entity") AS target_label
+    ORDER BY source, relation, target
+    LIMIT $limit
+    """
+    relationships = run_read_query(
+        query,
+        {"search": search.strip(), "entity_label": entity_label.strip(), "limit": safe_limit},
+    )
+
+    nodes: Dict[str, Dict[str, str]] = {}
+    for item in relationships:
+        nodes[item["source"]] = {"id": item["source"], "label": item["source_label"]}
+        nodes[item["target"]] = {"id": item["target"], "label": item["target_label"]}
+
+    return {"nodes": list(nodes.values()), "relationships": relationships}
+
+
+def get_entity_labels() -> List[str]:
+    records = run_read_query(
+        """
+        MATCH (entity:Entity)
+        WHERE entity.label IS NOT NULL
+        RETURN DISTINCT entity.label AS label
+        ORDER BY label
+        """
+    )
+    return [record["label"] for record in records if record.get("label")]
+
 def find_shortest_path(start_entity: str, end_entity: str, max_depth: int = 5) -> Dict[str, Any]:
     """
     Finds the shortest path between start_entity and end_entity.

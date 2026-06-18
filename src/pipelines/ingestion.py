@@ -1,6 +1,8 @@
 import os
+import sqlite3
 import sys
-import uuid
+import threading
+from datetime import datetime, timedelta, timezone
 from loguru import logger
 from src.config import settings
 from src.utils.parser import parse_file
@@ -15,21 +17,111 @@ if "src.pipelines.ingestion" in sys.modules and hasattr(sys.modules["src.pipelin
 else:
     INGESTION_PROGRESS = {}
 
+_PROGRESS_LOCK = threading.Lock()
+_REGISTRY_PATH = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
+    "data",
+    "ingestion_registry.db",
+)
+
 def _update_progress(conversation_id: str, document_id: str, percent: int, status: str, details: str = "", filename: str = ""):
     if conversation_id and document_id:
-        if conversation_id not in INGESTION_PROGRESS:
-            INGESTION_PROGRESS[conversation_id] = {}
-        INGESTION_PROGRESS[conversation_id][document_id] = {
-            "percent": percent,
-            "status": status,
-            "details": details,
-            "filename": filename or os.path.basename(document_id),
-        }
+        with _PROGRESS_LOCK:
+            if conversation_id not in INGESTION_PROGRESS:
+                INGESTION_PROGRESS[conversation_id] = {}
+            INGESTION_PROGRESS[conversation_id][document_id] = {
+                "percent": percent,
+                "status": status,
+                "details": details,
+                "filename": filename or os.path.basename(document_id),
+            }
+
+
+def _registry_connection() -> sqlite3.Connection:
+    os.makedirs(os.path.dirname(_REGISTRY_PATH), exist_ok=True)
+    connection = sqlite3.connect(_REGISTRY_PATH, timeout=30)
+    connection.execute("PRAGMA journal_mode=WAL")
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS ingestions (
+            document_id TEXT PRIMARY KEY,
+            checksum TEXT,
+            filename TEXT NOT NULL,
+            status TEXT NOT NULL,
+            attempts INTEGER NOT NULL DEFAULT 1,
+            started_at TEXT NOT NULL,
+            completed_at TEXT,
+            error TEXT
+        )
+        """
+    )
+    return connection
+
+
+def _claim_ingestion(document_id: str, checksum: str, filename: str) -> str:
+    """Atomically claim a document, or report an existing ingestion."""
+    now = datetime.now(timezone.utc).isoformat()
+    connection = _registry_connection()
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        row = connection.execute(
+            "SELECT status, started_at FROM ingestions WHERE document_id = ?",
+            (document_id,),
+        ).fetchone()
+        if row and row[0] == "completed":
+            connection.commit()
+            return "completed"
+        if row and row[0] == "running":
+            try:
+                started_at = datetime.fromisoformat(row[1])
+                still_active = datetime.now(timezone.utc) - started_at < timedelta(hours=1)
+            except (TypeError, ValueError):
+                still_active = False
+            if still_active:
+                connection.commit()
+                return "running"
+
+        connection.execute(
+            """
+            INSERT INTO ingestions
+                (document_id, checksum, filename, status, attempts, started_at, completed_at, error)
+            VALUES (?, ?, ?, 'running', 1, ?, NULL, NULL)
+            ON CONFLICT(document_id) DO UPDATE SET
+                status = 'running',
+                attempts = ingestions.attempts + 1,
+                started_at = excluded.started_at,
+                completed_at = NULL,
+                error = NULL
+            """,
+            (document_id, checksum, filename, now),
+        )
+        connection.commit()
+        return "claimed"
+    finally:
+        connection.close()
+
+
+def _finish_ingestion(document_id: str, status: str, error: str | None = None) -> None:
+    connection = _registry_connection()
+    try:
+        connection.execute(
+            """
+            UPDATE ingestions
+            SET status = ?, completed_at = ?, error = ?
+            WHERE document_id = ?
+            """,
+            (status, datetime.now(timezone.utc).isoformat(), error, document_id),
+        )
+        connection.commit()
+    finally:
+        connection.close()
 
 def ingest_document_pipeline(
     file_path: str,
     document_id: str = None,
     conversation_id: str = None,
+    checksum: str = "",
+    original_filename: str = "",
 ) -> dict:
     """
     Background (slow path) pipeline:
@@ -43,7 +135,17 @@ def ingest_document_pipeline(
     if not document_id:
         document_id = os.path.basename(file_path)
 
-    filename = os.path.basename(file_path)
+    filename = original_filename or os.path.basename(file_path)
+    claim = _claim_ingestion(document_id, checksum, filename)
+    if claim == "completed":
+        details = "This exact file was already indexed. Reused the existing knowledge."
+        _update_progress(conversation_id, document_id, 100, "completed", details, filename)
+        return {"document_id": document_id, "status": "already_indexed"}
+    if claim == "running":
+        details = "This exact file is already being indexed."
+        _update_progress(conversation_id, document_id, 5, "Ingestion already running", details, filename)
+        return {"document_id": document_id, "status": "already_running"}
+
     logger.info(f"Starting document ingestion pipeline for: {document_id}")
     _update_progress(conversation_id, document_id, 0, "Starting ingestion...", "", filename)
 
@@ -66,7 +168,12 @@ def ingest_document_pipeline(
         # 3. Vector Database Indexing (Pinecone)
         _update_progress(conversation_id, document_id, 50, "Generating embeddings & indexing in Pinecone...", f"Generating OpenAI embeddings and indexing {chunks_count} chunks in Pinecone...", filename)
         logger.info("Step 3: Indexing chunks in Pinecone...")
-        metadata_base = {"filename": os.path.basename(file_path)}
+        metadata_base = {
+            "filename": filename,
+            "checksum": checksum,
+            "conversation_id": conversation_id or "",
+            "type": "document",
+        }
         index_chunks(document_id, chunks, metadata_base)
         _update_progress(conversation_id, document_id, 65, "Vector store updated", f"Successfully indexed {chunks_count} chunks in Pinecone vector store.", filename)
         
@@ -115,6 +222,7 @@ def ingest_document_pipeline(
             f"\n**Entities Preview:**\n{entity_preview}"
         )
         _update_progress(conversation_id, document_id, 100, "completed", final_details, filename)
+        _finish_ingestion(document_id, "completed")
         
         return {
             "document_id": document_id,
@@ -126,4 +234,5 @@ def ingest_document_pipeline(
     except Exception as e:
         logger.error(f"Ingestion failed for {document_id}: {e}")
         _update_progress(conversation_id, document_id, 100, "failed", str(e), filename)
+        _finish_ingestion(document_id, "failed", str(e)[:2000])
         raise

@@ -45,7 +45,8 @@ from loguru import logger
 from src.agents.state import AgentState, HitlDecision, Message, RagContext, SearchResult
 from src.config import settings
 from src.tools.conversation_store import (
-    save_messages,
+    get_recent_conversation_history,
+    record_conversation_turn,
     save_search_results,
     upsert_conversation,
 )
@@ -108,12 +109,24 @@ def router(state: AgentState) -> Dict:
     user_query = state.get("user_query", "")
     uploaded_file_path = state.get("uploaded_file_path")
     fast_path_text = state.get("fast_path_text")
+    conversation_id = state.get("conversation_id", "")
     
     doc_context = ""
     if (uploaded_file_path and os.path.exists(uploaded_file_path)) or fast_path_text:
         doc_context = "[Context: A document has been uploaded in this session. If the user query is about the document, or refers to 'the document', 'the file', 'this', or 'it' in the context of the upload, choose 'rag'.]"
 
     logger.info(f"[Router] Deciding route for: '{user_query[:80]}...'")
+    recent_history = get_recent_conversation_history(
+        conversation_id,
+        max_messages=6,
+        max_characters=4000,
+    )
+    history_text = "\n".join(
+        f"{item['role']}: {item['content']}" for item in recent_history
+    )
+    if history_text:
+        doc_context += f"\nRecent conversation:\n{history_text}"
+
     llm = get_llm(temperature=0.0)
     response = llm.invoke([
         HumanMessage(content=ROUTER_PROMPT.format(query=user_query, document_context=doc_context))
@@ -292,7 +305,11 @@ def rag_retrieve(state: AgentState) -> Dict:
     emit("🧠 Semantic search: querying Pinecone vector store...", "step")
     logger.info(f"[RAG] Running hybrid retrieval for: '{user_query}'")
     try:
-        context = get_hybrid_context(user_query, top_k=5)
+        context = get_hybrid_context(
+            user_query,
+            top_k=5,
+            conversation_id=state.get("conversation_id"),
+        )
         chunks = context.get("text_chunks", [])
         graph = context.get("graph_context", [])
         extracted_entities = context.get("extracted_entities", [])
@@ -471,9 +488,21 @@ def llm_answer(state: AgentState) -> Dict:
     search_results = state.get("search_results", [])
     mcp_results = state.get("mcp_results", [])
     user_query = state.get("user_query", "")
+    conversation_id = state.get("conversation_id", "")
 
     # Build context sections
     context_parts = []
+
+    recent_history = get_recent_conversation_history(
+        conversation_id,
+        max_messages=12,
+        max_characters=12000,
+    )
+    if recent_history:
+        history_lines = [
+            f"{item['role'].title()}: {item['content']}" for item in recent_history
+        ]
+        context_parts.append("## Recent Conversation\n" + "\n\n".join(history_lines) + "\n")
 
     # 1. Uploaded file (fast path)
     if fast_path_text:
@@ -531,6 +560,18 @@ Please give a thorough and well-structured answer based on all the context above
 
     response = llm.invoke([HumanMessage(content=full_prompt)])
     answer = response.content
+
+    try:
+        record_conversation_turn(
+            conversation_id=conversation_id,
+            turn_id=state.get("turn_id", ""),
+            user_query=user_query,
+            final_answer=answer,
+            route=state.get("route", "direct"),
+            uploaded_file=state.get("uploaded_file_path"),
+        )
+    except Exception as exc:
+        logger.error(f"[History] Failed to persist conversation turn: {exc}")
 
     emit(f"✅ Answer ready ({len(answer)} characters)", "success")
     logger.info(f"[LLM] Answer generated ({len(answer)} chars)")
@@ -602,7 +643,6 @@ def save_conversation(state: AgentState) -> Dict:
     route = state.get("route")
     uploaded_file_path = state.get("uploaded_file_path")
     hitl_decision = state.get("hitl_decision")
-    messages = state.get("messages", [])
     search_results = state.get("search_results", [])
 
     logger.info(f"[Save] Persisting conversation {conversation_id} to SQLite...")
@@ -617,12 +657,6 @@ def save_conversation(state: AgentState) -> Dict:
             uploaded_file=uploaded_file_path,
             hitl_approved=hitl_decision.approved if hitl_decision else False,
             hitl_notes=hitl_decision.notes if hitl_decision else None,
-        )
-
-        # Save messages to SQLite
-        save_messages(
-            conversation_id,
-            [{"role": m.role, "content": m.content} for m in messages]
         )
 
         # Save web search results to SQLite
@@ -664,7 +698,16 @@ def save_conversation(state: AgentState) -> Dict:
             from src.utils.vector_store import chunk_text, index_chunks
             chunks = chunk_text(conversation_text)
             if chunks:
-                index_chunks(f"conv_{conversation_id}", chunks, {"conversation_id": conversation_id, "type": "conversation"})
+                turn_id = state.get("turn_id", "")
+                index_chunks(
+                    f"conv_{conversation_id}_{turn_id}",
+                    chunks,
+                    {
+                        "conversation_id": conversation_id,
+                        "turn_id": turn_id,
+                        "type": "conversation",
+                    },
+                )
                 emit(f"✅ Pinecone: indexed {len(chunks)} text chunks", "success")
                 logger.info(f"[Save] Indexed {len(chunks)} chunks in Pinecone.")
         except Exception as e:
@@ -734,14 +777,23 @@ def build_graph() -> StateGraph:
 
 # ─── Compile the graph (with interrupt at HITL) ───────────────────────────────
 
+if "_COMPILED_AGENT" not in globals():
+    _COMPILED_AGENT = None
+
+
 def compile_agent():
     """Returns the compiled LangGraph agent ready to invoke."""
+    global _COMPILED_AGENT
+    if _COMPILED_AGENT is not None:
+        return _COMPILED_AGENT
+
     from langgraph.checkpoint.memory import MemorySaver
     graph = build_graph()
     memory = MemorySaver()
-    return graph.compile(
+    _COMPILED_AGENT = graph.compile(
         checkpointer=memory,
     )
+    return _COMPILED_AGENT
 
 
 # ─── Convenience runner ───────────────────────────────────────────────────────
