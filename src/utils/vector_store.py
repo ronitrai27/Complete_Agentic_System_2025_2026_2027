@@ -1,9 +1,9 @@
 import os
-import uuid
+import time
 from typing import List, Dict, Any
 from loguru import logger
 from openai import OpenAI
-from pinecone import Pinecone
+from pinecone import Pinecone, ServerlessSpec
 from llama_index.core.node_parser import SentenceSplitter
 from src.config import settings
 
@@ -16,6 +16,26 @@ def get_pinecone_index():
     if not settings.pinecone_api_key:
         raise ValueError("Pinecone API key is not configured in settings.")
     pc = Pinecone(api_key=settings.pinecone_api_key)
+    existing_indexes = {item.name for item in pc.list_indexes()}
+    if settings.pinecone_index_name not in existing_indexes:
+        logger.warning(
+            f"Pinecone index '{settings.pinecone_index_name}' does not exist; creating it."
+        )
+        pc.create_index(
+            name=settings.pinecone_index_name,
+            dimension=1536,
+            metric="cosine",
+            spec=ServerlessSpec(cloud="aws", region="us-east-1"),
+        )
+        for _ in range(30):
+            description = pc.describe_index(settings.pinecone_index_name)
+            status = getattr(description, "status", None)
+            ready = getattr(status, "ready", False)
+            if isinstance(status, dict):
+                ready = status.get("ready", False)
+            if ready:
+                break
+            time.sleep(1)
     return pc.Index(settings.pinecone_index_name)
 
 def chunk_text(text: str, chunk_size: int = 1024, chunk_overlap: int = 200) -> List[str]:
@@ -84,6 +104,7 @@ def index_chunks(document_id: str, chunks: List[str], metadata_base: Dict[str, A
         index.upsert(vectors=vectors)
         
     logger.info(f"Successfully finished indexing document {document_id}.")
+
 
 def query_vector_store(
     query_text: str,

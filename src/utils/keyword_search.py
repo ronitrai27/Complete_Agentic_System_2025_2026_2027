@@ -145,6 +145,7 @@ def add_to_bm25_index(document_id: str, chunks: List[str], metadata: Dict[str, A
     manager = get_bm25_manager()
     manager.add_chunks(document_id, chunks, metadata)
 
+
 def query_bm25(query_text: str, top_k: int = 5) -> List[Dict[str, Any]]:
     manager = get_bm25_manager()
     return manager.query(query_text, top_k)

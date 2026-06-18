@@ -31,11 +31,27 @@ def run_read_query(query: str, parameters: Dict[str, Any] = None) -> List[Dict[s
         result = session.run(query, parameters or {})
         return [record.data() for record in result]
 
-def upsert_entities_and_relations(entities: List[Dict[str, str]], relations: List[Dict[str, str]]) -> None:
+def upsert_entities_and_relations(
+    entities: List[Dict[str, str]],
+    relations: List[Dict[str, str]],
+    document_id: str | None = None,
+    document_name: str = "",
+    source_type: str = "document",
+) -> None:
     """
     Saves extracted entities and relations to Neo4j.
+
+    Document provenance is additive: uploading a new document never deletes or
+    rewrites previous graph data. Entities are globally merged by name so a real
+    overlap, such as the same person or project appearing in two docs, becomes a
+    bridge. Otherwise each document remains its own disconnected component.
     """
-    logger.info(f"Upserting {len(entities)} entities and {len(relations)} relations to Neo4j...")
+    doc_id = (document_id or "").strip()
+    doc_name = (document_name or doc_id or "Unknown source").strip()
+    logger.info(
+        f"Upserting {len(entities)} entities and {len(relations)} relations to Neo4j "
+        f"for source: {doc_id or 'unscoped'}"
+    )
     
     # 1. Collect all unique entities from both lists (to prevent MATCH failures in step 2)
     entity_map = {}
@@ -56,9 +72,52 @@ def upsert_entities_and_relations(entities: List[Dict[str, str]], relations: Lis
     entity_query = """
     UNWIND $entities AS ent
     MERGE (e:Entity {name: ent.name})
-    SET e.label = ent.label
+    ON CREATE SET e.created_at = datetime()
+    SET e.label = ent.label,
+        e.updated_at = datetime(),
+        e.document_ids = CASE
+            WHEN $document_id = "" THEN coalesce(e.document_ids, [])
+            WHEN $document_id IN coalesce(e.document_ids, []) THEN coalesce(e.document_ids, [])
+            ELSE coalesce(e.document_ids, []) + $document_id
+        END,
+        e.sources = CASE
+            WHEN $document_name = "" THEN coalesce(e.sources, [])
+            WHEN $document_name IN coalesce(e.sources, []) THEN coalesce(e.sources, [])
+            ELSE coalesce(e.sources, []) + $document_name
+        END
     """
-    run_write_query(entity_query, {"entities": entities_payload})
+    run_write_query(
+        entity_query,
+        {
+            "entities": entities_payload,
+            "document_id": doc_id,
+            "document_name": doc_name if doc_id else "",
+        },
+    )
+
+    if doc_id:
+        document_query = """
+        MERGE (d:Document {id: $document_id})
+        ON CREATE SET d.created_at = datetime()
+        SET d.name = $document_name,
+            d.source_type = $source_type,
+            d.updated_at = datetime()
+        WITH d
+        UNWIND $entities AS ent
+        MATCH (e:Entity {name: ent.name})
+        MERGE (d)-[m:MENTIONS]->(e)
+        ON CREATE SET m.created_at = datetime()
+        SET m.updated_at = datetime()
+        """
+        run_write_query(
+            document_query,
+            {
+                "document_id": doc_id,
+                "document_name": doc_name,
+                "source_type": source_type,
+                "entities": entities_payload,
+            },
+        )
     
     # 2. Group relations by sanitized type and upsert them using MATCH (preventing lock contention)
     from collections import defaultdict
@@ -81,12 +140,32 @@ def upsert_entities_and_relations(entities: List[Dict[str, str]], relations: Lis
         MATCH (s:Entity {{name: rel.source}})
         MATCH (t:Entity {{name: rel.target}})
         MERGE (s)-[r:{clean_rel_type}]->(t)
+        ON CREATE SET r.created_at = datetime()
+        SET r.updated_at = datetime(),
+            r.document_ids = CASE
+                WHEN $document_id = "" THEN coalesce(r.document_ids, [])
+                WHEN $document_id IN coalesce(r.document_ids, []) THEN coalesce(r.document_ids, [])
+                ELSE coalesce(r.document_ids, []) + $document_id
+            END,
+            r.sources = CASE
+                WHEN $document_name = "" THEN coalesce(r.sources, [])
+                WHEN $document_name IN coalesce(r.sources, []) THEN coalesce(r.sources, [])
+                ELSE coalesce(r.sources, []) + $document_name
+            END
         """
-        run_write_query(relation_query, {"rels": rels})
+        run_write_query(
+            relation_query,
+            {"rels": rels, "document_id": doc_id, "document_name": doc_name if doc_id else ""},
+        )
         
     logger.info("Graph DB upsert completed successfully.")
 
-def get_neighbors(entity_name: str, limit: int = 15) -> List[Dict[str, Any]]:
+
+def get_neighbors(
+    entity_name: str,
+    limit: int = 15,
+    document_id: str | None = None,
+) -> List[Dict[str, Any]]:
     """
     Retrieves all direct neighbors of a specific entity using fuzzy matching.
     """
@@ -97,13 +176,25 @@ def get_neighbors(entity_name: str, limit: int = 15) -> List[Dict[str, Any]]:
     query = """
     MATCH (e:Entity) WHERE toLower(e.name) CONTAINS toLower($name)
     MATCH (e)-[r]-(n:Entity)
-    RETURN type(r) AS rel_type, n.name AS neighbor_name, n.label AS neighbor_label
+    WHERE ($document_id = "" OR $document_id IN coalesce(r.document_ids, []))
+    RETURN type(r) AS rel_type,
+           n.name AS neighbor_name,
+           n.label AS neighbor_label,
+           coalesce(r.document_ids, []) AS document_ids,
+           coalesce(r.sources, []) AS sources
     LIMIT $limit
     """
-    records = run_read_query(query, {"name": clean_name, "limit": limit})
+    records = run_read_query(
+        query,
+        {"name": clean_name, "limit": limit, "document_id": (document_id or "").strip()},
+    )
     return records
 
-def get_two_hop_neighbors(entity_name: str, limit: int = 20) -> List[Dict[str, Any]]:
+def get_two_hop_neighbors(
+    entity_name: str,
+    limit: int = 20,
+    document_id: str | None = None,
+) -> List[Dict[str, Any]]:
     """
     Retrieves 2-hop neighbors of a specific entity using fuzzy matching, representing paths:
     (Entity) <-> (Neighbor) <-> (Neighbor's Neighbor)
@@ -115,18 +206,27 @@ def get_two_hop_neighbors(entity_name: str, limit: int = 20) -> List[Dict[str, A
     query = """
     MATCH (e:Entity) WHERE toLower(e.name) CONTAINS toLower($name)
     MATCH (e)-[r1]-(n1:Entity)
+    WHERE ($document_id = "" OR $document_id IN coalesce(r1.document_ids, []))
     OPTIONAL MATCH (n1)-[r2]-(n2:Entity)
     WHERE n2 <> e
+      AND ($document_id = "" OR $document_id IN coalesce(r2.document_ids, []))
     RETURN e.name AS entity_name, 
            type(r1) AS r1_type, 
            n1.name AS n1_name, 
            n1.label AS n1_label,
+           coalesce(r1.document_ids, []) AS r1_document_ids,
+           coalesce(r1.sources, []) AS r1_sources,
            type(r2) AS r2_type, 
            n2.name AS n2_name, 
-           n2.label AS n2_label
+           n2.label AS n2_label,
+           coalesce(r2.document_ids, []) AS r2_document_ids,
+           coalesce(r2.sources, []) AS r2_sources
     LIMIT $limit
     """
-    records = run_read_query(query, {"name": clean_name, "limit": limit})
+    records = run_read_query(
+        query,
+        {"name": clean_name, "limit": limit, "document_id": (document_id or "").strip()},
+    )
     return records
 
 
@@ -134,6 +234,8 @@ def get_graph_snapshot(
     limit: int = 1000,
     search: str = "",
     entity_label: str = "",
+    document_id: str = "",
+    include_documents: bool = True,
 ) -> Dict[str, Any]:
     """Return a read-only, JSON-serializable snapshot for visualization."""
     safe_limit = max(1, min(int(limit), 5000))
@@ -146,18 +248,56 @@ def get_graph_snapshot(
       AND ($entity_label = ""
            OR toLower(source.label) = toLower($entity_label)
            OR toLower(target.label) = toLower($entity_label))
+      AND ($document_id = "" OR $document_id IN coalesce(relationship.document_ids, []))
     RETURN source.name AS source,
            coalesce(source.label, "Entity") AS source_label,
            type(relationship) AS relation,
            target.name AS target,
-           coalesce(target.label, "Entity") AS target_label
+           coalesce(target.label, "Entity") AS target_label,
+           coalesce(relationship.document_ids, []) AS document_ids,
+           coalesce(relationship.sources, []) AS sources
     ORDER BY source, relation, target
     LIMIT $limit
     """
     relationships = run_read_query(
         query,
-        {"search": search.strip(), "entity_label": entity_label.strip(), "limit": safe_limit},
+        {
+            "search": search.strip(),
+            "entity_label": entity_label.strip(),
+            "document_id": document_id.strip(),
+            "limit": safe_limit,
+        },
     )
+
+    if include_documents:
+        doc_query = """
+        MATCH (doc:Document)-[relationship:MENTIONS]->(target:Entity)
+        WHERE ($document_id = "" OR doc.id = $document_id)
+          AND ($search = ""
+               OR toLower(doc.name) CONTAINS toLower($search)
+               OR toLower(target.name) CONTAINS toLower($search))
+          AND ($entity_label = "" OR toLower(target.label) = toLower($entity_label))
+        RETURN "Document: " + coalesce(doc.name, doc.id) AS source,
+               "DOCUMENT" AS source_label,
+               type(relationship) AS relation,
+               target.name AS target,
+               coalesce(target.label, "Entity") AS target_label,
+               [doc.id] AS document_ids,
+               [coalesce(doc.name, doc.id)] AS sources
+        ORDER BY source, relation, target
+        LIMIT $limit
+        """
+        relationships.extend(
+            run_read_query(
+                doc_query,
+                {
+                    "search": search.strip(),
+                    "entity_label": entity_label.strip(),
+                    "document_id": document_id.strip(),
+                    "limit": safe_limit,
+                },
+            )
+        )
 
     nodes: Dict[str, Dict[str, str]] = {}
     for item in relationships:
@@ -177,6 +317,17 @@ def get_entity_labels() -> List[str]:
         """
     )
     return [record["label"] for record in records if record.get("label")]
+
+
+def get_graph_documents() -> List[Dict[str, str]]:
+    records = run_read_query(
+        """
+        MATCH (doc:Document)
+        RETURN doc.id AS id, coalesce(doc.name, doc.id) AS name
+        ORDER BY name
+        """
+    )
+    return [{"id": record["id"], "name": record["name"]} for record in records if record.get("id")]
 
 def find_shortest_path(start_entity: str, end_entity: str, max_depth: int = 5) -> Dict[str, Any]:
     """

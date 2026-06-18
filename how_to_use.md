@@ -113,7 +113,6 @@ ai_flow/
 │   ├── uploads/                 # Safe content-addressed uploads; gitignored
 │   ├── parsed/                  # Cached LlamaCloud markdown; gitignored
 │   ├── conversations.db         # Chat history; gitignored
-│   ├── ingestion_registry.db    # Idempotency state; gitignored
 │   └── bm25_index.pkl           # Local lexical index; gitignored
 ├── scripts/
 │   ├── chat_cli.py
@@ -205,31 +204,18 @@ Stored uploads use this structure:
 data/uploads/<conversation_id>/doc_<sha256>.<extension>
 ```
 
-### 5.3 Idempotent ingestion
+### 5.3 Repeatable ingestion
 
-Uploading the exact same content no longer creates a new random document identity.
+Each accepted upload runs the ingestion pipeline. The same file checksum still
+produces the same document ID, so writes remain repeatable:
 
-The ingestion pipeline records each document in:
+- Pinecone vector IDs are deterministic and are upserted
+- BM25 replaces chunks for the existing document ID
+- Neo4j uses `MERGE` for entities and relationships
+- A missing Pinecone index is recreated automatically
 
-```text
-data/ingestion_registry.db
-```
-
-Possible states:
-
-- `running`
-- `completed`
-- `failed`
-
-Behavior:
-
-- Completed documents are reused
-- Simultaneous duplicate ingestion is skipped
-- Failed ingestion can be retried
-- A stale `running` record older than one hour can be reclaimed
-- Pinecone vector IDs remain deterministic
-- BM25 already replaces chunks for an existing document ID
-- Neo4j uses `MERGE` for entity and relationship upserts
+This keeps the mini-project easy to understand: no separate ingestion registry
+or document-marker nodes are required.
 
 LlamaCloud parsing is also cached by file checksum:
 
@@ -297,8 +283,6 @@ Size, extension, signature, and filename validation
 SHA-256 document identity
     ↓
 Safe atomic local storage
-    ↓
-Ingestion registry claim
     ↓
 LlamaCloud parse or cached markdown
     ↓

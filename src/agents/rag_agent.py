@@ -682,7 +682,14 @@ def save_conversation(state: AgentState) -> Dict:
             relations = kg_elements.get("relations", [])
             
             if entities or relations:
-                upsert_entities_and_relations(entities, relations)
+                turn_id = state.get("turn_id", "")
+                upsert_entities_and_relations(
+                    entities,
+                    relations,
+                    document_id=f"conv_{conversation_id}_{turn_id}",
+                    document_name=f"Conversation {conversation_id}",
+                    source_type="conversation",
+                )
                 emit(f"✅ Neo4j: loaded {len(entities)} entities & {len(relations)} relations", "success")
                 logger.info(f"[Save] Ingested {len(entities)} entities and {len(relations)} relations to Neo4j.")
             else:

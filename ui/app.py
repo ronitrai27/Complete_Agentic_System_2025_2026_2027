@@ -267,6 +267,11 @@ uploaded_file = st.file_uploader(
     key="file_upload",
 )
 
+if uploaded_file is None and st.session_state.uploaded_name is not None:
+    # Allow removing and re-selecting the same file after a failed ingestion.
+    st.session_state.uploaded_name = None
+    st.session_state.uploaded_path = None
+
 if uploaded_file:
     from src.utils.uploads import store_upload
 

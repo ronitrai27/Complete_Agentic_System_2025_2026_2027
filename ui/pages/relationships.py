@@ -11,7 +11,10 @@ import streamlit as st
 import streamlit.components.v1 as components
 from pyvis.network import Network
 
-from src.utils.graph_store import get_entity_labels, get_graph_snapshot
+import importlib
+import src.utils.graph_store as graph_store
+
+graph_store = importlib.reload(graph_store)
 
 
 st.set_page_config(page_title="Knowledge Graph", page_icon="🕸️", layout="wide")
@@ -23,6 +26,13 @@ LABEL_COLORS = {
     "GPE": "#D97706",
     "LOC": "#EA580C",
     "LAW": "#DC2626",
+    "DOCUMENT": "#F8FAFC",
+    "SKILL": "#14B8A6",
+    "EXPERIENCE": "#F59E0B",
+    "ROLE": "#EC4899",
+    "PROJECT": "#10B981",
+    "FEATURE": "#06B6D4",
+    "TASK": "#64748B",
     "Entity": "#475569",
 }
 
@@ -82,8 +92,10 @@ if st.button("← Back to chat", use_container_width=False):
     st.switch_page("app.py")
 
 labels = []
+documents = []
 try:
-    labels = get_entity_labels()
+    labels = graph_store.get_entity_labels()
+    documents = graph_store.get_graph_documents()
 except Exception as exc:
     st.error(f"Could not connect to Neo4j: {exc}")
     st.stop()
@@ -92,14 +104,20 @@ with st.sidebar:
     st.header("Graph filters")
     search = st.text_input("Find entity or relationship", placeholder="e.g. OpenAI, WORKS_AT")
     selected_label = st.selectbox("Entity type", ["All"] + labels)
+    doc_options = {"All": ""}
+    doc_options.update({doc["name"]: doc["id"] for doc in documents})
+    selected_document = st.selectbox("Document graph", list(doc_options.keys()))
+    include_documents = st.checkbox("Show document source nodes", value=True)
     relationship_limit = st.slider("Maximum relationships", 100, 5000, 1000, step=100)
     st.caption("Large graphs are capped to keep the browser responsive.")
 
 with st.spinner("Loading connected graph from Neo4j…"):
-    snapshot = get_graph_snapshot(
+    snapshot = graph_store.get_graph_snapshot(
         limit=relationship_limit,
         search=search,
         entity_label="" if selected_label == "All" else selected_label,
+        document_id=doc_options[selected_document],
+        include_documents=include_documents,
     )
 
 node_count = len(snapshot["nodes"])

@@ -24,10 +24,24 @@ if "entity_ruler" not in nlp.pipe_names:
         "Legal", "Product", "Customer Success", "Infrastructure", "Data Science",
     ]
     _custom_features = [
-        "AI Assistant", "Authentication", "Analytics",
+        "AI Assistant", "Authentication", "Analytics", "GraphRAG",
         "Project Atlas", "Project Orion", "Project Nebula",
         "Project WeKraft", "WeKraft", "AWS infrastructure",
-        "Atlas", "Orion", "Nebula",
+        "Atlas", "Orion", "Nebula", "OpenAI Agent Workspace",
+        "Knowledge Graph", "Hybrid RAG", "Graph Only RAG",
+    ]
+    _skills = [
+        "Python", "TypeScript", "JavaScript", "React", "Next.js",
+        "Streamlit", "LangGraph", "LangChain", "OpenAI API",
+        "Neo4j", "Cypher", "Pinecone", "BM25", "LlamaParse",
+        "spaCy", "GraphRAG", "RAG", "Prompt Engineering",
+        "Product Management", "UX Research", "Security Review",
+        "API Design", "Data Modeling", "Workflow Automation",
+    ]
+    _roles = [
+        "Product Manager", "Engineering Lead", "Backend Engineer",
+        "Frontend Engineer", "Data Scientist", "Security Engineer",
+        "Designer", "QA Engineer", "Researcher", "Analyst",
     ]
     
     dept_patterns = [
@@ -44,7 +58,10 @@ if "entity_ruler" not in nlp.pipe_names:
         for name in _custom_features
     ]
     
-    ruler.add_patterns(dept_patterns + feature_patterns)
+    skill_patterns = [{"label": "SKILL", "pattern": name} for name in _skills]
+    role_patterns = [{"label": "ROLE", "pattern": name} for name in _roles]
+
+    ruler.add_patterns(dept_patterns + feature_patterns + skill_patterns + role_patterns)
 
 # Define target entity types we care about for knowledge graph construction
 TARGET_ENTITIES = {
@@ -57,46 +74,30 @@ TARGET_ENTITIES = {
     "FAC",         # Buildings, airports, highways, bridges
     "LAW",         # Named laws, policies
     "WORK_OF_ART", # Books, song titles, etc.
+    "SKILL",       # User/person skills, tools, frameworks, techniques
+    "EXPERIENCE",  # Prior experience domains or historical work areas
+    "ROLE",        # Job titles and project roles
+    "PROJECT",     # Internal projects and initiatives
+    "FEATURE",     # Product features and capabilities
+    "TASK",        # Work items, tasks, milestones
 }
 
-# --- Old spaCy extract_entities (basic, without EntityRuler) ---
-# def extract_entities(text: str) -> List[Dict[str, str]]:
-#     doc = nlp(text)
-#     entities = {}
-#     for ent in doc.ents:
-#         name = ent.text.strip()
-#         label = ent.label_
-#         if label in TARGET_ENTITIES and len(name) > 1:
-#             clean_name = name.replace("\n", " ").strip()
-#             if clean_name not in entities:
-#                 entities[clean_name] = label
-#     return [{"name": name, "label": label} for name, label in entities.items()]
-
-# --- LLM-based extract_entities (commented out — too slow for large document ingestion) ---
-# def extract_entities(text: str) -> List[Dict[str, str]]:
-#     """Uses gpt-4.1-nano — only suitable for short query strings, NOT full documents."""
-#     import os, json
-#     from langchain_openai import ChatOpenAI
-#     from langchain_core.messages import HumanMessage
-#     from src.config import settings
-#     from loguru import logger
-#     prompt = (
-#         "You are an expert entity extractor. Extract the main named entities from the text below.\n"
-#         "Specifically look for departments, organizations, people, products, and location names.\n"
-#         "Return ONLY a valid JSON: {\"entities\": [{\"name\": ..., \"label\": ...}]}\n\n"
-#         f"Text: {text}"
-#     )
-#     try:
-#         api_key = settings.openai_api_key or os.getenv("OPENAI_API_KEY")
-#         llm = ChatOpenAI(model="gpt-4.1-nano", temperature=0.0, api_key=api_key)
-#         response = llm.invoke([HumanMessage(content=prompt)])
-#         content = response.content.strip().strip("```json").strip("```").strip()
-#         data = json.loads(content)
-#         return data.get("entities", [])
-#     except Exception as e:
-#         logger.error(f"LLM entity extraction failed: {e}")
-#         return []
-
+PERSON_RE = r"[A-Z][A-Za-z.'-]+(?:\s+[A-Z][A-Za-z.'-]+){1,3}"
+ORG_OR_PRODUCT_HINTS = {
+    "api", "assistant", "atlas", "automation", "bm25", "dashboard", "graphrag",
+    "knowledge graph", "langgraph", "llamaparse", "neo4j", "openai", "pinecone",
+    "platform", "project", "rag", "streamlit", "wekraft", "workflow",
+}
+SKILL_HINTS = {
+    "api design", "bm25", "cypher", "data modeling", "graphrag", "javascript",
+    "langchain", "langgraph", "llamaparse", "neo4j", "next.js", "pinecone",
+    "prompt engineering", "python", "rag", "react", "security review", "spacy",
+    "streamlit", "typescript", "ux research", "workflow automation",
+}
+ROLE_HINTS = {
+    "analyst", "architect", "designer", "engineer", "lead", "manager",
+    "owner", "researcher", "scientist",
+}
 
 def _clean_and_validate_node(name: str) -> str:
     """
@@ -148,6 +149,85 @@ def _clean_and_validate_node(name: str) -> str:
         return ""
         
     return cleaned
+
+
+def _infer_entity_label(name: str, default: str = "Entity") -> str:
+    """Infer labels for entities that come from profile/work-history rules."""
+    lower = name.lower().strip()
+    if lower in SKILL_HINTS:
+        return "SKILL"
+    if any(word in lower.split() for word in ROLE_HINTS):
+        return "ROLE"
+    if lower.startswith("project ") or " project " in lower:
+        return "PROJECT"
+    if any(hint in lower for hint in ORG_OR_PRODUCT_HINTS):
+        return "PRODUCT"
+    return default
+
+
+def _remember_entity(entities: Dict[str, tuple], raw_name: str, label: str) -> None:
+    """Store an entity with longer-match deduplication."""
+    name = _clean_and_validate_node(raw_name)
+    if not name or re.fullmatch(r"[\d\W]+", name):
+        return
+
+    if label == "PERSON":
+        name = name.title()
+
+    lower = name.lower()
+    dominated = False
+    to_delete = []
+    for stored_lower, (stored_name, _stored_label) in entities.items():
+        if lower == stored_lower:
+            if len(name) > len(stored_name):
+                to_delete.append(stored_lower)
+            else:
+                dominated = True
+            break
+        if lower in stored_lower:
+            dominated = True
+            break
+        if stored_lower in lower:
+            to_delete.append(stored_lower)
+
+    for key in to_delete:
+        del entities[key]
+
+    if not dominated:
+        entities[lower] = (name, label)
+
+
+def _split_profile_items(items: str) -> List[str]:
+    """Split comma/and separated skills or past-work phrases into clean nodes."""
+    cleaned = re.sub(r"\([^)]*\)", "", items)
+    cleaned = re.sub(r"\b(?:and|plus)\b", ",", cleaned, flags=re.IGNORECASE)
+    parts = [part.strip(" .;:") for part in cleaned.split(",")]
+    return [part for part in parts if _clean_and_validate_node(part)]
+
+
+def _extract_profile_entities(text: str) -> List[Dict[str, str]]:
+    """Extract skills, roles, projects, and experience phrases from profile-like text."""
+    entities: Dict[str, str] = {}
+
+    for match in re.finditer(rf"\b({PERSON_RE})\b", text):
+        name = _clean_and_validate_node(match.group(1))
+        if name and _infer_entity_label(name) == "Entity":
+            entities[name] = "PERSON"
+
+    labelled_lists = [
+        (r"\bskills?\s*[:=-]\s*(?P<items>[^.\n]+)", "SKILL"),
+        (r"\b(?:past|previous|earlier)\s+experience\s*[:=-]\s*(?P<items>[^.\n]+)", "EXPERIENCE"),
+        (r"\b(?:role|title)\s*[:=-]\s*(?P<items>[^.\n]+)", "ROLE"),
+        (r"\b(?:projects?|products?)\s*[:=-]\s*(?P<items>[^.\n]+)", "PROJECT"),
+    ]
+    for pattern, label in labelled_lists:
+        for match in re.finditer(pattern, text, flags=re.IGNORECASE):
+            for item in _split_profile_items(match.group("items")):
+                name = _clean_and_validate_node(item)
+                if name:
+                    entities[name] = label
+
+    return [{"name": name, "label": label} for name, label in entities.items()]
 
 
 def extract_entities(text: str) -> List[Dict[str, str]]:
@@ -250,6 +330,9 @@ def extract_entities(text: str) -> List[Dict[str, str]]:
             if not dominated:
                 entities[lower] = (name, label)
 
+    for ent in _extract_profile_entities(clean_text):
+        _remember_entity(entities, ent["name"], ent["label"])
+
     return [{"name": name, "label": label} for name, label in entities.values()]
 
 
@@ -317,6 +400,117 @@ def _get_noun_chunk(token) -> str:
     return " ".join(words).strip()
 
 
+def _normalise_relation_type(relation: str) -> str:
+    return re.sub(r"[^A-Z0-9_]+", "_", relation.upper()).strip("_") or "RELATED_TO"
+
+
+def _add_relation(
+    relations: List[Dict[str, str]],
+    seen: set,
+    source: str,
+    relation_type: str,
+    target: str,
+) -> None:
+    clean_source = _clean_and_validate_node(source)
+    clean_target = _clean_and_validate_node(target)
+    if not clean_source or not clean_target or clean_source == clean_target:
+        return
+
+    relation = {
+        "source": clean_source,
+        "type": _normalise_relation_type(relation_type),
+        "target": clean_target,
+    }
+    relation_key = (
+        relation["source"].casefold(),
+        relation["type"],
+        relation["target"].casefold(),
+    )
+    if relation_key not in seen:
+        seen.add(relation_key)
+        relations.append(relation)
+
+
+def _extract_profile_relations(text: str) -> List[Dict[str, str]]:
+    """
+    Extract high-signal work-profile relations that dependency parsing often misses.
+
+    These rules are intentionally narrow and transparent. They target the document
+    shapes users usually upload for org/project memory: "Person has skills in X",
+    "Person previously worked at Y", "Person built Z", and "Person owns Project A".
+    """
+    relations: List[Dict[str, str]] = []
+    seen: set = set()
+
+    sentences = [s.strip() for s in re.split(r"[\n.;]+", text) if s.strip()]
+    work_verbs = {
+        "architects": "ARCHITECT",
+        "builds": "BUILD",
+        "built": "BUILT",
+        "creates": "CREATE",
+        "created": "CREATE",
+        "designs": "DESIGN",
+        "develops": "DEVELOP",
+        "implements": "IMPLEMENT",
+        "leads": "LEAD",
+        "maintains": "MAINTAIN",
+        "manages": "MANAGE",
+        "owns": "OWN",
+        "tests": "TEST",
+    }
+
+    for sentence in sentences:
+        skill_match = re.search(
+            rf"\b(?P<person>{PERSON_RE})\b\s+(?:has|uses|brings|knows|specializes\s+in|is\s+skilled\s+in)\s+"
+            rf"(?:(?:skills?|expertise|experience)\s+(?:in|with)\s+)?(?P<items>.+)$",
+            sentence,
+            flags=re.IGNORECASE,
+        )
+        if skill_match:
+            for item in _split_profile_items(skill_match.group("items")):
+                _add_relation(relations, seen, skill_match.group("person"), "SKILLED_IN", item)
+
+        exp_match = re.search(
+            rf"\b(?P<person>{PERSON_RE})\b\s+(?:previously|earlier|formerly)\s+"
+            rf"(?P<verb>worked\s+(?:at|for|with|on)|served\s+at|built|created|developed|led|designed)\s+"
+            rf"(?P<items>.+)$",
+            sentence,
+            flags=re.IGNORECASE,
+        )
+        if exp_match:
+            verb = exp_match.group("verb").lower()
+            relation_type = "HAS_EXPERIENCE_IN"
+            if "worked at" in verb or "worked for" in verb or "served at" in verb:
+                relation_type = "WORKED_AT"
+            elif "worked on" in verb:
+                relation_type = "WORKED_ON"
+            elif verb in {"built", "created", "developed", "led", "designed"}:
+                relation_type = f"PREVIOUSLY_{verb.upper()}"
+            for item in _split_profile_items(exp_match.group("items")):
+                _add_relation(relations, seen, exp_match.group("person"), relation_type, item)
+
+        profile_exp_match = re.search(
+            rf"\b(?P<person>{PERSON_RE})\b.+\b(?:past|previous|earlier)\s+experience\s+(?:includes|with|in)\s+"
+            rf"(?P<items>.+)$",
+            sentence,
+            flags=re.IGNORECASE,
+        )
+        if profile_exp_match:
+            for item in _split_profile_items(profile_exp_match.group("items")):
+                _add_relation(relations, seen, profile_exp_match.group("person"), "HAS_EXPERIENCE_IN", item)
+
+        for verb, relation_type in work_verbs.items():
+            work_match = re.search(
+                rf"\b(?P<person>{PERSON_RE})\b\s+{verb}\s+(?P<target>.+)$",
+                sentence,
+                flags=re.IGNORECASE,
+            )
+            if work_match:
+                _add_relation(relations, seen, work_match.group("person"), relation_type, work_match.group("target"))
+
+    return relations
+
+
 def extract_knowledge_graph_elements(text: str) -> Dict[str, Any]:
     """
     Combines Entity extraction and Relation/SVO extraction to construct
@@ -360,6 +554,26 @@ def extract_knowledge_graph_elements(text: str) -> Dict[str, Any]:
             if relation_key not in seen_relations:
                 seen_relations.add(relation_key)
                 cleaned_relations.append(relation)
+
+    for relation in _extract_profile_relations(text):
+        _add_relation(
+            cleaned_relations,
+            seen_relations,
+            relation["source"],
+            relation["type"],
+            relation["target"],
+        )
+
+    entity_map = {ent["name"].casefold(): ent for ent in entities}
+    for relation in cleaned_relations:
+        for side in ("source", "target"):
+            name = relation[side]
+            key = name.casefold()
+            if key not in entity_map:
+                label = "PERSON" if re.fullmatch(PERSON_RE, name) else _infer_entity_label(name)
+                ent = {"name": name, "label": label}
+                entity_map[key] = ent
+                entities.append(ent)
             
     return {
         "entities": entities,

@@ -103,7 +103,9 @@ def get_hybrid_context(
                             "entity": e_name,
                             "relation": f"{r1_type}-->({n1_name})--{r2_type}",
                             "neighbor": n2_name,
-                            "neighbor_label": record.get("n2_label")
+                            "neighbor_label": record.get("n2_label"),
+                            "sources": record.get("r2_sources") or record.get("r1_sources") or [],
+                            "document_ids": record.get("r2_document_ids") or record.get("r1_document_ids") or [],
                         })
                     else:
                         # 1-hop fallback
@@ -111,7 +113,9 @@ def get_hybrid_context(
                             "entity": e_name,
                             "relation": r1_type,
                             "neighbor": n1_name,
-                            "neighbor_label": record.get("n1_label")
+                            "neighbor_label": record.get("n1_label"),
+                            "sources": record.get("r1_sources") or [],
+                            "document_ids": record.get("r1_document_ids") or [],
                         })
             else:
                 logger.info(f"Performing 1-hop lookup for: '{name}'")
@@ -121,7 +125,9 @@ def get_hybrid_context(
                         "entity": name,
                         "relation": neighbor.get("rel_type"),
                         "neighbor": neighbor.get("neighbor_name"),
-                        "neighbor_label": neighbor.get("neighbor_label")
+                        "neighbor_label": neighbor.get("neighbor_label"),
+                        "sources": neighbor.get("sources") or [],
+                        "document_ids": neighbor.get("document_ids") or [],
                     })
     except Exception as e:
         logger.error(f"Graph context lookup failed: {e}")
