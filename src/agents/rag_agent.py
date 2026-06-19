@@ -458,11 +458,12 @@ def mcp_agent(state: AgentState, config: RunnableConfig) -> Dict:
 
     try:
         # Run async MCP logic; GraphInterrupt will propagate through asyncio.run
-        # because it is a BaseException subclass, not a regular Exception.
         mcp_results = asyncio.run(_run_mcp())
+    except GraphInterrupt:
+        # Re-raise GraphInterrupt so LangGraph can pause the graph and handle it
+        raise
     except Exception as e:
         # Only catch genuine errors (network failures, API errors, etc.)
-        # GraphInterrupt is a BaseException so it won't be caught here.
         import traceback
         traceback.print_exc()
         emit(f"⚠️ MCP Agent failed: {e}", "warning")

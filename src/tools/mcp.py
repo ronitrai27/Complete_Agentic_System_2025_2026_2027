@@ -1,4 +1,3 @@
-# ARCADE MCP (NOTION + GOOGLE DOC + GMAIL + MICROSOFT OUTLOOK MAIL)
 
 # ARCADE MCP (NOTION + GOOGLE DOC + GMAIL + MICROSOFT OUTLOOK MAIL)
 
@@ -77,6 +76,8 @@ async def arcade_to_langchain(
         )
 
         if auth_response.status != "completed":
+            from src.utils.event_bus import emit
+            emit(f"🔐 Authorization required for **{arcade_tool.qualified_name}**. [Click here to authorize]({auth_response.url})", "warning")
             # Pause the LangGraph agent and bubble up auth info
             interrupt_result = interrupt({
                 "type": "authorization_required",
