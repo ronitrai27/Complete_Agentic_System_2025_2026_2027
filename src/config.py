@@ -25,6 +25,7 @@ class Settings(BaseSettings):
     serpapi_api_key: Optional[str] = Field(default=None, validation_alias="SERPAPI_API_KEY")
     tavily_api_key: Optional[str] = Field(default=None, validation_alias="TAVILY_API_KEY")
     llama_cloud_api_key: Optional[str] = Field(default=None, validation_alias="LLAMA_CLOUD_API_KEY")
+    composio_api_key: Optional[str] = Field(default=None, validation_alias="COMPOSIO_API_KEY")
 
     # Pinecone
     pinecone_index_name: str = Field(default="agentic-system", validation_alias="PINECONE_INDEX_NAME")
