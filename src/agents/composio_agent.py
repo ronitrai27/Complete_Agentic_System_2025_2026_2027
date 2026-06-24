@@ -33,6 +33,8 @@ TOOLKIT_CATALOG: list[dict[str, str]] = [
     {"slug": "todoist", "name": "Todoist", "icon": "✅"},
     {"slug": "slack", "name": "Slack", "icon": "💬"},
     {"slug": "reddit", "name": "Reddit", "icon": "🤖"},
+    {"slug": "linkedin", "name": "LinkedIn", "icon": "💼"},
+    {"slug": "googlemeet", "name": "Google Meet", "icon": "📹"},
 ]
 
 TOOLKITS: list[str] = [t["slug"] for t in TOOLKIT_CATALOG]
@@ -40,7 +42,7 @@ TOOLKITS: list[str] = [t["slug"] for t in TOOLKIT_CATALOG]
 SYSTEM_PROMPT = """You are a connected-apps assistant powered by Composio.
 
 You can fetch and read data from the user's integrations:
-Jira, Linear, Gmail, Google Calendar, Notion, GitHub, Typeform, Apollo, Todoist, Slack, and Reddit.
+Jira, Linear, Gmail, Google Calendar, Notion, GitHub, Typeform, Apollo, Todoist, Slack, Reddit, LinkedIn, and Google Meet.
 
 When the user asks you to summarize or report on something:
 1. Search for and call the right Composio tools to fetch the data.
@@ -103,6 +105,8 @@ def get_toolkit_status(session) -> list[dict[str, Any]]:
                     connected_slugs.add("gmail")
                 if "calendar" in slug:
                     connected_slugs.add("googlecalendar")
+                if "meet" in slug:
+                    connected_slugs.add("googlemeet")
     except Exception:
         pass
 

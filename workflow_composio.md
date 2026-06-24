@@ -133,3 +133,87 @@ def validate_parameters(tool_name: str, args: dict, user_id: str):
 1. **Database**: Store the saved workflow JSON (name, steps, fields, scheduled intervals) in a database (like PostgreSQL).
 2. **Workers**: Run task execution in a celery worker pool. If a workflow fails, retry it with exponential backoff.
 3. **Multi-Tenancy**: Use unique, encrypted user IDs for `user_id`. Never share session keys or database IDs between accounts.
+
+---
+
+## 5. Toolkit Connection & Disconnection Management
+
+### A. How a User Connects to Apps (OAuth flow)
+To connect a user to a toolkit (like Slack or GitHub), you initiate an OAuth flow through a user session. Composio generates a redirect URL where the user completes authorization:
+
+```python
+from composio import Composio
+
+comp = Composio(api_key="your_composio_api_key")
+session = comp.create(user_id="user_v55i61letn6c")
+
+# Initiate authorization and get the OAuth redirect URL
+auth_request = session.authorize("slack")
+print(f"Send the user to this URL: {auth_request.redirect_url}")
+```
+
+### B. What to Save in the Database
+To avoid calling the Composio API repeatedly (which causes lag on the frontend), you should cache the integration state in a local database like SQLite or PostgreSQL.
+
+**Recommended SQLite Table Schema**:
+```sql
+CREATE TABLE IF NOT EXISTS connected_toolkits (
+    user_id    TEXT,
+    toolkit    TEXT,      -- e.g., 'slack', 'gmail', 'github'
+    connected  INTEGER,   -- 1 = connected/active, 0 = disconnected
+    updated_at TEXT,
+    PRIMARY KEY (user_id, toolkit)
+);
+```
+
+**Workflow for Syncing with DB**:
+1. When the user loads the app, call `session.toolkits()` to get the live connection statuses.
+2. Loop over the result and upsert the connection flags (`1` or `0`) into the database.
+3. The frontend UI queries the local database for instant sidebar updates.
+
+### C. Checking if an App Connection is Created/Active
+You can check if a toolkit is active either by querying the cached database state or by calling the Composio API live:
+
+```python
+# Live API Check
+def is_app_connected(user_id: str, toolkit_slug: str) -> bool:
+    try:
+        session = comp.create(user_id=user_id)
+        toolkits = session.toolkits()
+        for tk in toolkits:
+            if tk.slug.lower() == toolkit_slug.lower():
+                return tk.connection and tk.connection.is_active
+    except Exception:
+        pass
+    return False
+```
+
+### D. How to Disconnect/Delete an App Connection
+Yes, users can disconnect their accounts. In Composio, connections are stored as `connected_accounts`. You can retrieve these connections and delete/disable them:
+
+```python
+# Disconnect/Delete a connected account
+def disconnect_app(user_id: str, toolkit_slug: str) -> bool:
+    try:
+        # 1. Retrieve all active connected accounts for the user and toolkit
+        accounts_res = comp.connected_accounts.list(
+            user_ids=[user_id], 
+            toolkit_slugs=[toolkit_slug]
+        )
+        
+        # 2. Delete the active connected accounts
+        deleted_any = False
+        for account in accounts_res.items:
+            if account.status == "ACTIVE":
+                comp.connected_accounts.delete(account.id)
+                deleted_any = True
+                
+        # 3. Update the local database cache
+        # (Execute query to set connected = 0 for the user_id and toolkit_slug)
+        
+        return deleted_any
+    except Exception as e:
+        print(f"Error disconnecting {toolkit_slug}: {e}")
+        return False
+```
+
