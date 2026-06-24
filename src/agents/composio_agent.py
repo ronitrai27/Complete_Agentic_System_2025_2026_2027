@@ -31,6 +31,8 @@ TOOLKIT_CATALOG: list[dict[str, str]] = [
     {"slug": "typeform", "name": "Typeform", "icon": "📊"},
     {"slug": "apollo", "name": "Apollo", "icon": "🚀"},
     {"slug": "todoist", "name": "Todoist", "icon": "✅"},
+    {"slug": "slack", "name": "Slack", "icon": "💬"},
+    {"slug": "reddit", "name": "Reddit", "icon": "🤖"},
 ]
 
 TOOLKITS: list[str] = [t["slug"] for t in TOOLKIT_CATALOG]
@@ -38,7 +40,7 @@ TOOLKITS: list[str] = [t["slug"] for t in TOOLKIT_CATALOG]
 SYSTEM_PROMPT = """You are a connected-apps assistant powered by Composio.
 
 You can fetch and read data from the user's integrations:
-Jira, Linear, Gmail, Google Calendar, Notion, GitHub, Typeform, Apollo, and Todoist.
+Jira, Linear, Gmail, Google Calendar, Notion, GitHub, Typeform, Apollo, Todoist, Slack, and Reddit.
 
 When the user asks you to summarize or report on something:
 1. Search for and call the right Composio tools to fetch the data.
