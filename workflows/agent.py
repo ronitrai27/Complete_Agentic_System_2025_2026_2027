@@ -52,9 +52,10 @@ STEP 3: Call set_workflow() with the workflow name, description, and all steps.
   - EXCLUDE all highly technical, secondary optional fields (such as 'cc', 'bcc', 'attachment', 'unfurl_links', 'unfurl_media', 'reply_broadcast', 'thread_ts', 'extra_recipients', etc.) unless the user explicitly requested them in their message. This keeps the user form clean and simple.
 
 ## CRITICAL RULES:
-- You are a DESIGNER only. Do NOT call COMPOSIO_MULTI_EXECUTE_TOOL. Do NOT actually execute any actions.
-- You MUST call COMPOSIO_GET_TOOL_SCHEMAS before set_workflow to get the real parameter names.
-- Always populate "value" in fields when you can infer it from the user's message (e.g. message body, channel name).
+- You are a DESIGNER only. You do NOT have tools to execute actions. If the user asks you to run, execute, or test the workflow in the chat, explain that you are a designer and instruct them to click the "Run Workflow" button in the right-side panel.
+- To pass the output of a previous step to a subsequent step, use the placeholder `{{step_N}}` where N is the 1-based index of the step (e.g., `{{step_1}}` for the output of Step 1, or `{{step_1.some_key}}` for a nested key if known).
+- For example, if Step 1 is `LINKEDIN_GET_MY_INFO` and Step 2 is `GMAIL_SEND_EMAIL`, you must pre-fill the `body` field of the Gmail step with a value like: "Here is my LinkedIn profile info: {{step_1}}"
+- Always populate "value" in fields when you can infer it from the user's message (or when it references a previous step using `{{step_N}}`).
 - Leave "value" as "" for fields the user must fill in (e.g. recipient email, API keys).
 - After calling set_workflow, tell the user to review the fields on the right panel and click "Run Workflow".
 """
@@ -124,9 +125,12 @@ def compile_workflow_agent(session, workflow_holder: dict):
     composio_tools = list(session.tools())
     print(f"[compile_workflow_agent] Composio meta-tools loaded: {[t.name for t in composio_tools]}", flush=True)
 
+    # Filter out execution tools so the designer cannot run them directly in chat
+    allowed_tools = [t for t in composio_tools if t.name != "COMPOSIO_MULTI_EXECUTE_TOOL"]
+
     # Add our custom set_workflow tool
     set_wf = make_set_workflow_tool(workflow_holder)
-    tools = composio_tools + [set_wf]
+    tools = allowed_tools + [set_wf]
 
     llm = get_llm()
     return create_react_agent(model=llm, tools=tools, prompt=SYSTEM_PROMPT)

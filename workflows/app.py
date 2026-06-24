@@ -248,6 +248,115 @@ def coerce_value_for_widget(val: Any, val_type: str) -> Any:
         return str(val)
 
 
+def resolve_placeholders(val: Any, run_results: list[dict], target_type: str = "string") -> Any:
+    """
+    Recursively search and resolve placeholders in the format {{step_N}} or {{step_N.key.subkey}}
+    using execution results of previous steps.
+    """
+    import re
+    import json
+    
+    def pretty_format_data(data: Any) -> str:
+        if isinstance(data, dict):
+            lines = []
+            for k, v in data.items():
+                k_pretty = k.replace("_", " ").title()
+                if isinstance(v, (dict, list)):
+                    v_str = json.dumps(v, indent=2)
+                else:
+                    v_str = str(v)
+                lines.append(f"- **{k_pretty}**: {v_str}")
+            return "\n".join(lines)
+        elif isinstance(data, list):
+            lines = []
+            for item in data:
+                if isinstance(item, (dict, list)):
+                    lines.append(f"- {json.dumps(item)}")
+                else:
+                    lines.append(f"- {item}")
+            return "\n".join(lines)
+        return str(data)
+
+    if isinstance(val, str):
+        pattern = r"\{\{\s*step_(\d+)(?:\.([a-zA-Z0-9_\-\.]+))?\s*\}\}"
+        
+        # If the string is exactly a single placeholder, return the resolved value
+        match = re.fullmatch(pattern, val.strip())
+        if match:
+            step_num = int(match.group(1))
+            path = match.group(2)
+            result = next((r for r in run_results if r["step_idx"] == step_num), None)
+            if not result or not result["success"]:
+                return ""
+            data = result["data"]
+            if not path:
+                resolved = data
+            else:
+                # Walk the dot-separated path in data
+                parts = path.split(".")
+                curr = data
+                for part in parts:
+                    if isinstance(curr, dict) and part in curr:
+                        curr = curr[part]
+                    elif isinstance(curr, list):
+                        try:
+                            curr = curr[int(part)]
+                        except (ValueError, IndexError):
+                            return ""
+                    else:
+                        try:
+                            curr = getattr(curr, part)
+                        except AttributeError:
+                            return ""
+                resolved = curr
+
+            # Format if target_type is string and the resolved value is complex
+            if target_type == "string" and isinstance(resolved, (dict, list)):
+                return pretty_format_data(resolved)
+            return resolved
+
+        # Otherwise, mixed string replacement
+        def replace_match(m):
+            step_num = int(m.group(1))
+            path = m.group(2)
+            result = next((r for r in run_results if r["step_idx"] == step_num), None)
+            if not result or not result["success"]:
+                return ""
+            data = result["data"]
+            if not path:
+                resolved = data
+            else:
+                parts = path.split(".")
+                curr = data
+                for part in parts:
+                    if isinstance(curr, dict) and part in curr:
+                        curr = curr[part]
+                    elif isinstance(curr, list):
+                        try:
+                            curr = curr[int(part)]
+                        except (ValueError, IndexError):
+                            return ""
+                    else:
+                        try:
+                            curr = getattr(curr, part)
+                        except AttributeError:
+                            return ""
+                resolved = curr
+            
+            if isinstance(resolved, (dict, list)):
+                return pretty_format_data(resolved)
+            return str(resolved)
+
+        return re.sub(pattern, replace_match, val)
+
+    elif isinstance(val, list):
+        return [resolve_placeholders(item, run_results, target_type) for item in val]
+    elif isinstance(val, dict):
+        return {k: resolve_placeholders(v, run_results, target_type) for k, v in val.items()}
+    return val
+
+
+
 # ─── Tool Branding Helper ─────────────────────────────────────────────────────
 
 def get_tool_branding(tool_name: str) -> tuple[str, str]:
@@ -625,6 +734,10 @@ with col_workflow:
                                 if state_key in st.session_state:
                                     val = st.session_state[state_key]
                                     arg_type = arg_info.get("type", "string")
+                                    
+                                    # Resolve step placeholders dynamically
+                                    val = resolve_placeholders(val, st.session_state["workflow_run_results"], arg_type)
+                                    
                                     if arg_type in ("array", "object") and isinstance(val, str):
                                         val = val.strip()
                                         if not val:
@@ -646,6 +759,10 @@ with col_workflow:
                                 state_key = f"wf_step_{idx}_{arg}"
                                 if state_key in st.session_state:
                                     val = st.session_state[state_key]
+                                    
+                                    # Resolve step placeholders dynamically
+                                    val = resolve_placeholders(val, st.session_state["workflow_run_results"], arg_type)
+                                    
                                     if arg_type in ("array", "object", "list") and isinstance(val, str):
                                         val = val.strip()
                                         if not val:
