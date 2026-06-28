@@ -378,6 +378,8 @@ def get_tool_branding(tool_name: str) -> tuple[str, str]:
         return "#0077B5", "💼 LinkedIn"
     elif "meet" in name:
         return "#00897B", "📹 Google Meet"
+    elif "googledocs" in name or "google doc" in name or "docs" in name:
+        return "#4285F4", "📄 Google Docs"
     elif "google" in name or "calendar" in name:
         return "#4285F4", "📅 Google"
     elif "github" in name:
